@@ -16,7 +16,9 @@ permissions:
 jobs:
   ssdlc:
     uses: ./.github/workflows/ssdlc.yml
-    secrets: inherit
+    # First-party workflow; it declares only ANTHROPIC_API_KEY. inherit is the
+    # documented SSDLC caller contract (quonfig/ci README).
+    secrets: inherit # nosemgrep: yaml.github-actions.security.secrets-inherit.secrets-inherit
     with:
       # quonfig/ci has no dependency manifests to scan.
       deps: false
