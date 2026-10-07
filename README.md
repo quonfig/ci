@@ -33,8 +33,9 @@ require these check names, as shown on a PR for a caller whose job id is
 | Check | Job |
 |-------|-----|
 | `ssdlc / sanity` | AI sanity check |
+| `ssdlc / secrets` | gitleaks scan of the PR's commits |
 
-(Later beads add `ssdlc / secrets`, `ssdlc / deps`, `ssdlc / sast`.)
+(Later beads add `ssdlc / deps`, `ssdlc / sast`.)
 
 ## Jobs
 
@@ -65,10 +66,37 @@ A cheap, basic check, not a full code review.
 
 Inputs (all optional): `max_changed_lines` (3000), `model`, `max_turns` (6).
 
+### `secrets`: gitleaks secret scan
+
+- Runs the [gitleaks](https://github.com/gitleaks/gitleaks) CLI binary (not
+  `gitleaks-action`, which needs a paid license for orgs), pinned to a release
+  and verified against a pinned SHA-256 (`GITLEAKS_VERSION` /
+  `GITLEAKS_SHA256` in the workflow; bump both together from the release's
+  `checksums.txt`).
+- Scans only the PR's own commits, `base.sha..head.sha`, so findings already in
+  history do not fail every PR. Secrets are redacted in logs; findings show as
+  annotations with rule, file, line and commit.
+- Fails on any finding. Runs on every PR event including drafts and label
+  changes (it is cheap and deterministic).
+- Per-repo tuning, optional: `.gitleaks.toml` (start it with
+  `[extend]` / `useDefault = true` to keep the default rules) and/or
+  `.gitleaksignore` (one finding fingerprint per line; the failing run prints
+  them). Both are read from the **base** commit, never from the PR, so a PR
+  cannot allowlist its own leak; a change to them takes effect once merged.
+  An inline `gitleaks:allow` comment on the line also works and is visible in
+  review.
+- A real leaked credential must be rotated; removing it from the branch is not
+  enough once it has been pushed.
+
+GitHub secret scanning and push protection are also enabled on every public
+in-scope repo (repo settings). Private repos would need paid GHAS for that,
+so this job is the control there.
+
 ## Hotfix override
 
 Adding the `hotfix` label to a PR always overrides the gate: `sanity` passes
-without running the AI, so Jeff is never hard-blocked. On the first hotfix run
+without running the AI, and `secrets` reports findings as warnings but passes,
+so Jeff is never hard-blocked. On the first hotfix run
 the workflow posts one comment asking for:
 
 1. a justification comment on the PR, and

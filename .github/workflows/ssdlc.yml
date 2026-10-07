@@ -1,10 +1,13 @@
 # SSDLC umbrella reusable workflow (SOC 2, epic qfg-66ko).
 #
 # Every in-scope repo calls this from a thin .github/workflows/ssdlc.yml on
-# pull_request. Jobs here: sanity (AI sanity check, hotfix-aware). Later
-# beads add secrets, deps and sast jobs alongside it.
+# pull_request. Jobs here (all hotfix-aware):
+#   sanity  - AI sanity check
+#   secrets - gitleaks scan of the PR's commits (base..head)
+# Later beads add deps and sast jobs alongside them.
 #
-# Required check name in a caller whose job id is `ssdlc`: "ssdlc / sanity".
+# Required check names in a caller whose job id is `ssdlc`:
+#   "ssdlc / sanity", "ssdlc / secrets".
 name: ssdlc
 
 on:
@@ -77,7 +80,7 @@ jobs:
             --jq "[.[] | select(.body | contains(\"$marker\"))] | length" | awk '{s+=$1} END {print s+0}')
           if [ "$existing" -eq 0 ]; then
             body="$marker
-          **Hotfix override applied.** The \`hotfix\` label skips the AI sanity check so this PR is not blocked.
+          **Hotfix override applied.** The \`hotfix\` label overrides the SSDLC gates (AI sanity check skipped; secrets-scan findings reported but not enforced) so this PR is not blocked.
 
           Per the SSDLC policy, please, within **2 business days**:
           1. Reply on this PR with a short justification for bypassing the normal review.
@@ -223,3 +226,112 @@ jobs:
             *)
               echo "::notice title=SSDLC sanity::$verdict" ;;
           esac
+
+  secrets:
+    name: secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Cheap and deterministic: runs on every PR event, drafts and label
+    # changes included (removing `hotfix` re-enforces the scan).
+    if: github.event_name == 'pull_request'
+    concurrency:
+      group: ssdlc-secrets-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      # sha256 of gitleaks_8.30.1_linux_x64.tar.gz (matches the release's
+      # gitleaks_8.30.1_checksums.txt). Bump both together.
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      HAS_HOTFIX: ${{ contains(github.event.pull_request.labels.*.name, 'hotfix') }}
+    steps:
+      - name: Checkout PR head (full history)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks (pinned, checksum-verified)
+        run: |
+          set -euo pipefail
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          dir="$RUNNER_TEMP/gitleaks"
+          mkdir -p "$dir"
+          curl -sSfL -o "$dir/$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${tarball}"
+          echo "${GITLEAKS_SHA256}  $dir/$tarball" | sha256sum -c -
+          tar -xzf "$dir/$tarball" -C "$dir" gitleaks
+          "$dir/gitleaks" version
+          echo "$dir" >> "$GITHUB_PATH"
+
+      - name: Resolve config from the base branch
+        id: cfg
+        run: |
+          set -euo pipefail
+          # Config and ignore files come from the BASE commit, never the PR, so
+          # a PR cannot allowlist its own leak. Changes to .gitleaks.toml or
+          # .gitleaksignore take effect once merged.
+          cfg_dir="$RUNNER_TEMP/gitleaks-cfg"
+          mkdir -p "$cfg_dir"
+          if git cat-file -e "$BASE_SHA:.gitleaks.toml" 2>/dev/null; then
+            git show "$BASE_SHA:.gitleaks.toml" > "$cfg_dir/gitleaks.toml"
+            echo "Using the repo's .gitleaks.toml from base ${BASE_SHA:0:7}"
+          else
+            printf '[extend]\nuseDefault = true\n' > "$cfg_dir/gitleaks.toml"
+            echo "No .gitleaks.toml on base; using the gitleaks default rules"
+          fi
+          if git cat-file -e "$BASE_SHA:.gitleaksignore" 2>/dev/null; then
+            git show "$BASE_SHA:.gitleaksignore" > "$cfg_dir/.gitleaksignore"
+            echo "Using the repo's .gitleaksignore from base ${BASE_SHA:0:7}"
+          else
+            : > "$cfg_dir/.gitleaksignore"
+          fi
+          echo "dir=$cfg_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Scan PR commits (base..head)
+        env:
+          CFG_DIR: ${{ steps.cfg.outputs.dir }}
+        run: |
+          set -uo pipefail
+          range="${BASE_SHA}..${HEAD_SHA}"
+          echo "Commits in range $range:"
+          git log --oneline "$range"
+          report="$RUNNER_TEMP/gitleaks-report.json"
+          gitleaks git . \
+            --log-opts="$range" \
+            --config "$CFG_DIR/gitleaks.toml" \
+            --gitleaks-ignore-path "$CFG_DIR/.gitleaksignore" \
+            --redact \
+            --no-banner \
+            --report-format json \
+            --report-path "$report" \
+            --exit-code 2
+          rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "::notice title=SSDLC secrets::no secrets found in the PR's commits"
+            exit 0
+          elif [ "$rc" -ne 2 ]; then
+            echo "::error title=SSDLC secrets::gitleaks failed to run (exit $rc)"
+            exit "$rc"
+          fi
+          count=$(jq 'length' "$report")
+          # Secret values are redacted; report location only.
+          jq -r '.[] | "\(.RuleID)\t\(.File)\t\(.StartLine)\t\(.Commit)"' "$report" |
+            while IFS=$'\t' read -r rule file line commit; do
+              level=error
+              [ "$HAS_HOTFIX" = "true" ] && level=warning
+              echo "::$level file=$file,line=$line,title=SSDLC secrets::$rule in commit ${commit:0:7}"
+            done
+          fp_help="If this is a false positive: add the fingerprint to .gitleaksignore or an allowlist to .gitleaks.toml in a separate PR (base-branch config is used), or mark the line with a 'gitleaks:allow' comment."
+          if [ "$HAS_HOTFIX" = "true" ]; then
+            echo "::warning title=SSDLC secrets::$count finding(s) ignored because of the hotfix label. Rotate any real credential and remove it."
+            exit 0
+          fi
+          echo "::error title=SSDLC secrets::$count potential secret(s) in this PR's commits. Remove them (rewrite the PR branch) and rotate any real credential. $fp_help Add the 'hotfix' label to override."
+          echo "Fingerprints (for .gitleaksignore):"
+          jq -r '.[].Fingerprint' "$report"
+          exit 1
