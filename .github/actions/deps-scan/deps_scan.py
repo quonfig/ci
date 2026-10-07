@@ -250,7 +250,8 @@ def main() -> int:
                 high = (score is not None and score >= HIGH_SCORE) or label in BLOCKING_LABELS
                 if not high:
                     continue
-                primary = sorted(g.get("ids", []), key=lambda x: (not x.startswith("GHSA"), x))[0]
+                # Prefer a GHSA id; fall back to any alias if a group has no ids.
+                primary = sorted(g.get("ids") or ids or ["UNKNOWN"], key=lambda x: (not x.startswith("GHSA"), x))[0]
                 row = {
                     "id": primary,
                     "ids": sorted(ids),
