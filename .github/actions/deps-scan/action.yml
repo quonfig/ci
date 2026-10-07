@@ -1,0 +1,59 @@
+name: SSDLC dependency scan
+description: >
+  Scans every lockfile/manifest in the checked-out repo with osv-scanner
+  (pinned, checksum-verified) and applies the Quonfig HIGH/CRITICAL policy via
+  deps_scan.py. Go modules get osv-scanner's call analysis (the govulncheck
+  engine), so unreachable Go vulns are reported but do not fail.
+inputs:
+  hotfix:
+    description: "'true' when the PR carries the hotfix label (findings become warnings)"
+    default: "false"
+  enforce:
+    description: "'false' = report-only (findings become warnings)"
+    default: "true"
+runs:
+  using: composite
+  steps:
+    - name: Detect root go.mod
+      id: detect
+      shell: bash
+      run: |
+        if [ -f "$GITHUB_WORKSPACE/go.mod" ]; then echo "go=true" >> "$GITHUB_OUTPUT"; else echo "go=false" >> "$GITHUB_OUTPUT"; fi
+
+    # Go call analysis builds the module; use the repo's own Go version.
+    - name: Set up Go
+      if: steps.detect.outputs.go == 'true'
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+        cache: false
+
+    - name: Install osv-scanner (pinned, checksum-verified)
+      shell: bash
+      env:
+        OSV_VERSION: 2.6.0
+        # sha256 of osv-scanner_linux_amd64 from the release's
+        # osv-scanner_SHA256SUMS. Bump both together.
+        OSV_SHA256: ca69b3d3cd08f889a49dc0a383122f71cc528b83803671df5fd874d97485b108
+      run: |
+        set -euo pipefail
+        dir="$RUNNER_TEMP/osv-scanner"
+        mkdir -p "$dir"
+        curl -sSfL -o "$dir/osv-scanner" \
+          "https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/osv-scanner_linux_amd64"
+        echo "${OSV_SHA256}  $dir/osv-scanner" | sha256sum -c -
+        chmod +x "$dir/osv-scanner"
+        "$dir/osv-scanner" --version | head -n1
+        echo "OSV_BIN=$dir/osv-scanner" >> "$GITHUB_ENV"
+
+    - name: Scan and apply policy
+      shell: bash
+      env:
+        HOTFIX: ${{ inputs.hotfix }}
+        ENFORCE: ${{ inputs.enforce }}
+      run: |
+        set -uo pipefail
+        args=(--osv-bin "$OSV_BIN" --repo "$GITHUB_WORKSPACE")
+        [ "$HOTFIX" = "true" ] && args+=(--hotfix)
+        [ "$ENFORCE" = "true" ] || args+=(--report-only)
+        python3 "$GITHUB_ACTION_PATH/deps_scan.py" "${args[@]}"

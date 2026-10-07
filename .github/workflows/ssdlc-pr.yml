@@ -17,3 +17,6 @@ jobs:
   ssdlc:
     uses: ./.github/workflows/ssdlc.yml
     secrets: inherit
+    with:
+      # quonfig/ci has no dependency manifests to scan.
+      deps: false
