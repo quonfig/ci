@@ -34,8 +34,10 @@ require these check names, as shown on a PR for a caller whose job id is
 |-------|-----|
 | `ssdlc / sanity` | AI sanity check |
 | `ssdlc / secrets` | gitleaks scan of the PR's commits |
+| `ssdlc / deps` | osv-scanner dependency vulnerability scan |
 
-(Later beads add `ssdlc / deps`, `ssdlc / sast`.)
+(A later bead adds `ssdlc / sast`.) A caller that sets `deps: false` reports
+`ssdlc / deps` as skipped, which satisfies a required check.
 
 ## Jobs
 
@@ -92,10 +94,98 @@ GitHub secret scanning and push protection are also enabled on every public
 in-scope repo (repo settings). Private repos would need paid GHAS for that,
 so this job is the control there.
 
+### `deps`: dependency vulnerability scan
+
+Scans every lockfile and manifest in the repo at the PR head (the whole
+dependency tree, not just the diff, so a newly published advisory shows up on
+the next PR) and fails only on **HIGH/CRITICAL** findings that are not ignored.
+
+- Engine: [osv-scanner](https://github.com/google/osv-scanner) v2 for every
+  ecosystem, pinned and SHA-256 verified (`OSV_VERSION` / `OSV_SHA256` in
+  [`.github/actions/deps-scan/action.yml`](.github/actions/deps-scan/action.yml)).
+  The policy layer is
+  [`deps_scan.py`](.github/actions/deps-scan/deps_scan.py) (stdlib only,
+  Python 3.11+).
+- HIGH/CRITICAL means: the advisory group's highest CVSS score is >= 7.0, or
+  GitHub rates the advisory HIGH or CRITICAL (this covers advisories that have
+  no CVSS vector). Lower severities are not reported here; Dependabot covers
+  them.
+- Dev dependencies are enforced like runtime ones. pnpm and yarn lockfiles do
+  not mark dev-only packages reliably, so a dev exemption would only work for
+  npm, and test/build tooling runs in CI next to secrets.
+- Results: one annotation per finding (package, advisory, severity, fixed
+  version, lockfile) plus a table in the job summary. GitHub shows at most 10
+  annotations of each level per step; the log and the summary have them all.
+- Manifests that resolve to no packages (Gradle without dependency locking,
+  Swift without a committed `Package.resolved`, .NET central package
+  management without `packages.lock.json`, a `pyproject.toml` with no lock)
+  produce a warning saying they are **not scanned**.
+
+Ecosystem coverage and why osv-scanner everywhere instead of each native tool:
+
+| Ecosystem | Detected from | Checker | Why |
+|-----------|---------------|---------|-----|
+| npm / pnpm / yarn | `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock` | osv-scanner | Same GitHub advisory data as `npm/pnpm/yarn audit`, but no package-manager install, one behaviour across all three (yarn 1 vs berry audit differ), and offline lockfile parsing. |
+| Go | `go.mod` | osv-scanner with call analysis | osv-scanner v2 embeds the govulncheck engine: vulns whose vulnerable symbols are never called are reported as warnings, not failures, exactly like `govulncheck`. Go is set up from the repo's `go.mod` for this. |
+| Ruby | `Gemfile.lock` | osv-scanner | bundler-audit uses ruby-advisory-db, which is also ingested by OSV; no Ruby toolchain needed. |
+| Python | `poetry.lock`, `uv.lock`, `requirements*.txt` | osv-scanner | pip-audit needs an installed environment; OSV includes PyPA's advisory DB. |
+| .NET | `packages.lock.json`, `*.csproj` with inline versions | osv-scanner | `dotnet list package --vulnerable` needs a restore. Central package management needs `packages.lock.json` to be scanned. |
+| Java | `pom.xml`, `gradle.lockfile` | osv-scanner | Maven resolves transitives via deps.dev. Gradle needs dependency locking enabled. |
+| Swift | `Package.resolved` | osv-scanner | No mature native auditor. |
+
+One engine means one severity rule, one ignore file format and one output
+format for the SOC 2 evidence, whatever the language.
+
+#### Ignoring a finding
+
+Put an `osv-scanner.toml` at the repo root (osv-scanner's own format, so a
+local `osv-scanner scan source -r .` honours it too):
+
+```toml
+[[IgnoredVulns]]
+id = "GHSA-xxxx-xxxx-xxxx"        # GHSA, CVE or GO- id; any alias matches
+ignoreUntil = 2026-12-31          # optional but expected; expired = enforced again
+reason = "Not reachable: we never parse untrusted YAML. Upgrade tracked in qfg-xxxx."
+```
+
+- `reason` is **mandatory**. An entry without one, or any other table such as
+  `[[PackageOverrides]]`, fails the check as a config error.
+- The file is read from the **PR head**, unlike the gitleaks config. A
+  dependency ignore exposes nothing by being pushed, the entry is in the diff
+  for the reviewer and the AI sanity check, and a new advisory must be
+  ignorable in the same PR that it starts failing. Nested
+  `osv-scanner.toml` files are not honoured.
+
+#### Enforcement rollout
+
+Inputs: `deps` (default `true`) runs the job; `deps_enforce` (default
+**`false`** for now) makes findings fail the check. Report-only mode posts the
+same annotations and summary but the check passes.
+
+All in-scope repos, SDKs included, run the scan (`deps: true`). The SDK
+findings are real (mostly stale transitive JS packages and test tooling, fixed
+by a lockfile refresh), not false-positive noise, and an SDK ships to
+customers, so it gets the same control. Enforcement is off by default only
+because every JS repo already has HIGH/CRITICAL findings; once that backlog is
+fixed (bead `qfg-66ko.3` follow-up), flip the `deps_enforce` default to `true`
+here and every repo is gated at once. A repo that wants enforcement earlier
+sets `deps_enforce: true` in its caller.
+
+To run the check locally before pushing (any OS; needs Python 3.11+):
+
+```bash
+# download osv-scanner_<os>_<arch> from the pinned release, then from the repo root:
+python3 path/to/ci/.github/actions/deps-scan/deps_scan.py --osv-bin ./osv-scanner --repo .
+```
+
+Run it on a clean clone: osv-scanner skips git-ignored paths, and a sub-repo
+nested inside the gitignored monorepo checkout looks ignored to it.
+
 ## Hotfix override
 
 Adding the `hotfix` label to a PR always overrides the gate: `sanity` passes
-without running the AI, and `secrets` reports findings as warnings but passes,
+without running the AI, and `secrets` and `deps` report findings as warnings
+but pass,
 so Jeff is never hard-blocked. On the first hotfix run
 the workflow posts one comment asking for:
 

@@ -4,10 +4,11 @@
 # pull_request. Jobs here (all hotfix-aware):
 #   sanity  - AI sanity check
 #   secrets - gitleaks scan of the PR's commits (base..head)
-# Later beads add deps and sast jobs alongside them.
+#   deps    - osv-scanner HIGH/CRITICAL dependency vulnerability scan
+# A later bead adds a sast job alongside them.
 #
 # Required check names in a caller whose job id is `ssdlc`:
-#   "ssdlc / sanity", "ssdlc / secrets".
+#   "ssdlc / sanity", "ssdlc / secrets", "ssdlc / deps".
 name: ssdlc
 
 on:
@@ -25,6 +26,17 @@ on:
         description: Max agent turns for the sanity check.
         type: number
         default: 6
+      deps:
+        description: Run the dependency vulnerability scan (deps job).
+        type: boolean
+        default: true
+      deps_enforce:
+        description: >-
+          Fail the deps check on unignored HIGH/CRITICAL findings. false =
+          report-only (annotations + job summary, check passes). Rollout
+          default is false until the existing backlog is fixed (qfg-66ko.3).
+        type: boolean
+        default: false
     secrets:
       ANTHROPIC_API_KEY:
         required: false
@@ -80,7 +92,7 @@ jobs:
             --jq "[.[] | select(.body | contains(\"$marker\"))] | length" | awk '{s+=$1} END {print s+0}')
           if [ "$existing" -eq 0 ]; then
             body="$marker
-          **Hotfix override applied.** The \`hotfix\` label overrides the SSDLC gates (AI sanity check skipped; secrets-scan findings reported but not enforced) so this PR is not blocked.
+          **Hotfix override applied.** The \`hotfix\` label overrides the SSDLC gates (AI sanity check skipped; secrets and dependency scan findings reported but not enforced) so this PR is not blocked.
 
           Per the SSDLC policy, please, within **2 business days**:
           1. Reply on this PR with a short justification for bypassing the normal review.
@@ -336,3 +348,31 @@ jobs:
           echo "Fingerprints (for .gitleaksignore):"
           jq -r '.[].Fingerprint' "$report"
           exit 1
+
+  deps:
+    name: deps
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Deterministic, so it runs on every PR event like secrets (drafts and
+    # label changes included: removing `hotfix` re-enforces the scan).
+    if: github.event_name == 'pull_request' && inputs.deps
+    concurrency:
+      group: ssdlc-deps-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      # Scans the whole dependency tree at the PR head (not just the diff):
+      # a newly published advisory shows up on the next PR in that repo.
+      - name: Dependency vulnerability scan
+        uses: quonfig/ci/.github/actions/deps-scan@main
+        with:
+          hotfix: ${{ contains(github.event.pull_request.labels.*.name, 'hotfix') }}
+          enforce: ${{ inputs.deps_enforce }}
