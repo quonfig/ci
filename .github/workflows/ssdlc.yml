@@ -301,6 +301,9 @@ jobs:
           echo "Commits in range $range:"
           git log --oneline "$range"
           report="$RUNNER_TEMP/gitleaks-report.json"
+          # Actions runs bash with -e; capture gitleaks' exit code instead of
+          # letting a finding (exit 2) abort the step before reporting/hotfix.
+          rc=0
           gitleaks git . \
             --log-opts="$range" \
             --config "$CFG_DIR/gitleaks.toml" \
@@ -309,8 +312,7 @@ jobs:
             --no-banner \
             --report-format json \
             --report-path "$report" \
-            --exit-code 2
-          rc=$?
+            --exit-code 2 || rc=$?
           if [ "$rc" -eq 0 ]; then
             echo "::notice title=SSDLC secrets::no secrets found in the PR's commits"
             exit 0
@@ -322,8 +324,7 @@ jobs:
           # Secret values are redacted; report location only.
           jq -r '.[] | "\(.RuleID)\t\(.File)\t\(.StartLine)\t\(.Commit)"' "$report" |
             while IFS=$'\t' read -r rule file line commit; do
-              level=error
-              [ "$HAS_HOTFIX" = "true" ] && level=warning
+              if [ "$HAS_HOTFIX" = "true" ]; then level=warning; else level=error; fi
               echo "::$level file=$file,line=$line,title=SSDLC secrets::$rule in commit ${commit:0:7}"
             done
           fp_help="If this is a false positive: add the fingerprint to .gitleaksignore or an allowlist to .gitleaks.toml in a separate PR (base-branch config is used), or mark the line with a 'gitleaks:allow' comment."
