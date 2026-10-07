@@ -35,9 +35,10 @@ require these check names, as shown on a PR for a caller whose job id is
 | `ssdlc / sanity` | AI sanity check |
 | `ssdlc / secrets` | gitleaks scan of the PR's commits |
 | `ssdlc / deps` | osv-scanner dependency vulnerability scan |
+| `ssdlc / sast` | Semgrep CE static analysis |
 
-(A later bead adds `ssdlc / sast`.) A caller that sets `deps: false` reports
-`ssdlc / deps` as skipped, which satisfies a required check.
+A caller that sets `deps: false` or `sast: false` reports that check as
+skipped, which satisfies a required check.
 
 ## Jobs
 
@@ -181,11 +182,54 @@ python3 path/to/ci/.github/actions/deps-scan/deps_scan.py --osv-bin ./osv-scanne
 Run it on a clean clone: osv-scanner skips git-ignored paths, and a sub-repo
 nested inside the gitignored monorepo checkout looks ignored to it.
 
+### `sast`: Semgrep static analysis
+
+Lightweight SAST with [Semgrep CE](https://semgrep.dev) (no account, no token,
+`--metrics=off`), using the high-confidence `p/ci` registry ruleset. CodeQL on
+private repos needs paid GHAS, so Semgrep is the control here.
+
+- Install: `pip install semgrep==<SEMGREP_VERSION>` into a venv on the runner
+  (pinned in the workflow env; bump deliberately). The `p/ci` rules are
+  fetched from the Semgrep registry at run time.
+- **Only ERROR-severity findings fail the check** (semgrep's newer
+  `HIGH`/`CRITICAL` levels count as ERROR). WARNING/INFO findings are listed
+  in the job summary and the log but pass.
+- **Diff-aware**: the scan runs with `--baseline-commit <merge base>`, so only
+  findings the PR introduces are reported. Pre-existing findings never block.
+- Findings show as annotations (rule, file, line) plus a table in the job
+  summary. Files semgrep cannot fully parse are counted, not failed.
+- Runs on every PR event, drafts and label changes included (deterministic).
+- A semgrep tool failure (registry unreachable, bad config) fails the check
+  with a clear "tool error" message; re-run it or use the hotfix label.
+- Input: `sast` (default `true`).
+
+False positives, per repo, both visible in the PR diff:
+
+- Inline, on the flagged line, with a reason:
+  `foo() // nosemgrep: <rule-id> -- why this is safe`
+  (`# nosemgrep: ...` in YAML/Python/Ruby).
+- A root `.semgrepignore` (semgrep's own gitignore-style format) to exclude
+  paths such as generated code or fixtures. Start it with
+  `:include .gitignore`, because a repo `.semgrepignore` replaces semgrep's
+  built-in default ignores. Read from the PR head, like `osv-scanner.toml`.
+
+The caller template's own `secrets: inherit` carries a reasoned `nosemgrep`
+(the `secrets-inherit` rule is ERROR in `p/ci`): the callee is this
+first-party workflow and declares only `ANTHROPIC_API_KEY`.
+
+Run it locally the same way before pushing:
+
+```bash
+pip install semgrep==1.179.0
+semgrep scan --config p/ci --metrics=off --baseline-commit "$(git merge-base origin/main HEAD)"
+semgrep scan --config p/ci --metrics=off --severity ERROR   # full scan
+```
+
 ## Hotfix override
 
 Adding the `hotfix` label to a PR always overrides the gate: `sanity` passes
-without running the AI, and `secrets` and `deps` report findings as warnings
-but pass,
+without running the AI, and `secrets`, `deps` and `sast` report findings as
+warnings but pass,
 so Jeff is never hard-blocked. On the first hotfix run
 the workflow posts one comment asking for:
 

@@ -5,10 +5,10 @@
 #   sanity  - AI sanity check
 #   secrets - gitleaks scan of the PR's commits (base..head)
 #   deps    - osv-scanner HIGH/CRITICAL dependency vulnerability scan
-# A later bead adds a sast job alongside them.
+#   sast    - Semgrep CE p/ci static analysis, ERROR severity only, diff-aware
 #
 # Required check names in a caller whose job id is `ssdlc`:
-#   "ssdlc / sanity", "ssdlc / secrets", "ssdlc / deps".
+#   "ssdlc / sanity", "ssdlc / secrets", "ssdlc / deps", "ssdlc / sast".
 name: ssdlc
 
 on:
@@ -37,6 +37,10 @@ on:
           default is false until the existing backlog is fixed (qfg-66ko.3).
         type: boolean
         default: false
+      sast:
+        description: Run the Semgrep static analysis (sast job).
+        type: boolean
+        default: true
     secrets:
       ANTHROPIC_API_KEY:
         required: false
@@ -92,7 +96,7 @@ jobs:
             --jq "[.[] | select(.body | contains(\"$marker\"))] | length" | awk '{s+=$1} END {print s+0}')
           if [ "$existing" -eq 0 ]; then
             body="$marker
-          **Hotfix override applied.** The \`hotfix\` label overrides the SSDLC gates (AI sanity check skipped; secrets and dependency scan findings reported but not enforced) so this PR is not blocked.
+          **Hotfix override applied.** The \`hotfix\` label overrides the SSDLC gates (AI sanity check skipped; secrets, dependency and static analysis findings reported but not enforced) so this PR is not blocked.
 
           Per the SSDLC policy, please, within **2 business days**:
           1. Reply on this PR with a short justification for bypassing the normal review.
@@ -376,3 +380,103 @@ jobs:
         with:
           hotfix: ${{ contains(github.event.pull_request.labels.*.name, 'hotfix') }}
           enforce: ${{ inputs.deps_enforce }}
+
+  sast:
+    name: sast
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Deterministic, so it runs on every PR event like secrets and deps
+    # (drafts and label changes included: removing `hotfix` re-enforces it).
+    if: github.event_name == 'pull_request' && inputs.sast
+    concurrency:
+      group: ssdlc-sast-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+    env:
+      # Bump deliberately. The p/ci ruleset is fetched from the Semgrep
+      # registry at run time (Semgrep CE: no account, no token).
+      SEMGREP_VERSION: 1.179.0
+      SEMGREP_CONFIG: p/ci
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      HAS_HOTFIX: ${{ contains(github.event.pull_request.labels.*.name, 'hotfix') }}
+    steps:
+      - name: Checkout PR head (full history, for the merge base)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Semgrep CE (pinned)
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/semgrep-venv"
+          "$RUNNER_TEMP/semgrep-venv/bin/pip" install --quiet --disable-pip-version-check "semgrep==${SEMGREP_VERSION}"
+          "$RUNNER_TEMP/semgrep-venv/bin/semgrep" --version
+          echo "$RUNNER_TEMP/semgrep-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Scan (diff-aware) and apply policy
+        env:
+          SEMGREP_SEND_METRICS: "off"
+        run: |
+          set -uo pipefail
+          # Diff-aware: only findings this PR introduces relative to the merge
+          # base are reported, so pre-existing findings never block a PR.
+          # Exclusions: a root .semgrepignore (semgrep's own format; read from
+          # the PR head, so a new entry is visible in the diff) and inline
+          # `nosemgrep: <rule-id>` comments with a reason.
+          merge_base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          echo "Merge base: $merge_base (base ${BASE_SHA:0:7}, head ${HEAD_SHA:0:7})"
+          out="$RUNNER_TEMP/semgrep.json"
+          rc=0
+          semgrep scan --config "$SEMGREP_CONFIG" --metrics=off --disable-version-check \
+            --baseline-commit "$merge_base" --json --output "$out" --quiet || rc=$?
+          # Without --error semgrep exits 0 even with findings: non-zero means
+          # the tool itself failed (registry unreachable, bad config, ...).
+          if [ "$rc" -ne 0 ] || [ ! -s "$out" ]; then
+            echo "::error title=SSDLC sast::semgrep failed to run (exit $rc). This is a tool error, not a finding; re-run the job, or add the 'hotfix' label to override."
+            exit 2
+          fi
+          # Only ERROR fails (semgrep's newer HIGH/CRITICAL levels count as ERROR).
+          # shellcheck disable=SC2016  # $s is a jq variable, not shell
+          defs='def blk: (.extra.severity | ascii_upcase) as $s | ($s == "ERROR" or $s == "HIGH" or $s == "CRITICAL"); def clean: gsub("[|%\\r\\n]"; " ") | .[0:300];'
+          blocking=$(jq "$defs"' [.results[] | select(blk)] | length' "$out")
+          other=$(jq "$defs"' [.results[] | select(blk | not)] | length' "$out")
+          parse_errors=$(jq '.errors | length' "$out")
+          {
+            echo "## SSDLC sast (Semgrep CE $SEMGREP_CONFIG, diff-aware against ${merge_base:0:7})"
+            echo
+            echo "- Blocking (ERROR) findings introduced by this PR: **$blocking**"
+            echo "- Non-blocking (WARNING/INFO) findings introduced: $other"
+            echo "- Files semgrep could not fully parse: $parse_errors (not a failure)"
+            echo
+            if [ "$((blocking + other))" -gt 0 ]; then
+              echo "| Severity | Rule | Location | Message |"
+              echo "|----------|------|----------|---------|"
+              jq -r "$defs"' (.results | map(select(blk)) + map(select(blk | not)))[]
+                | "| \(.extra.severity) | \(.check_id) | \(.path):\(.start.line) | \(.extra.message | clean) |"' "$out"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$HAS_HOTFIX" = "true" ]; then level=warning; else level=error; fi
+          jq -r "$defs"' .results[] | select(blk) | [.path, (.start.line | tostring), .check_id, (.extra.message | clean)] | @tsv' "$out" |
+            while IFS=$'\t' read -r file line rule msg; do
+              echo "::$level file=$file,line=$line,title=SSDLC sast::$rule: $msg"
+            done
+          jq -r "$defs"' .results[] | select(blk | not) | "note: \(.extra.severity) \(.check_id) \(.path):\(.start.line)"' "$out"
+          if [ "$blocking" -eq 0 ]; then
+            echo "::notice title=SSDLC sast::no ERROR-severity findings introduced ($other non-blocking)"
+            exit 0
+          fi
+          if [ "$HAS_HOTFIX" = "true" ]; then
+            echo "::warning title=SSDLC sast::$blocking ERROR finding(s) not enforced because of the hotfix label"
+            exit 0
+          fi
+          echo "::error title=SSDLC sast::$blocking ERROR-severity finding(s) introduced by this PR. Fix them, or for a false positive add a 'nosemgrep: <rule-id>' comment with a reason on the line (or a .semgrepignore entry). Add the 'hotfix' label to override."
+          exit 1
