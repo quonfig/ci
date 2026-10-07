@@ -1,0 +1,225 @@
+# SSDLC umbrella reusable workflow (SOC 2, epic qfg-66ko).
+#
+# Every in-scope repo calls this from a thin .github/workflows/ssdlc.yml on
+# pull_request. Jobs here: sanity (AI sanity check, hotfix-aware). Later
+# beads add secrets, deps and sast jobs alongside it.
+#
+# Required check name in a caller whose job id is `ssdlc`: "ssdlc / sanity".
+name: ssdlc
+
+on:
+  workflow_call:
+    inputs:
+      max_changed_lines:
+        description: Skip the AI (and pass) when additions+deletions exceed this.
+        type: number
+        default: 3000
+      model:
+        description: Claude model for the sanity check.
+        type: string
+        default: claude-haiku-4-5-20251001
+      max_turns:
+        description: Max agent turns for the sanity check.
+        type: number
+        default: 6
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: false
+
+jobs:
+  sanity:
+    name: sanity
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Draft PRs are skipped entirely. Marking ready_for_review triggers a run.
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    concurrency:
+      group: ssdlc-sanity-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      checks: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      ACTION: ${{ github.event.action }}
+      EVENT_LABEL: ${{ github.event.label.name }}
+      HAS_HOTFIX: ${{ contains(github.event.pull_request.labels.*.name, 'hotfix') }}
+      ADDITIONS: ${{ github.event.pull_request.additions }}
+      DELETIONS: ${{ github.event.pull_request.deletions }}
+      MAX_CHANGED_LINES: ${{ inputs.max_changed_lines }}
+    steps:
+      - name: Decide mode
+        id: mode
+        run: |
+          # hotfix  -> pass, post the justification request once
+          # mirror  -> a non-hotfix label changed: re-report the last verdict, no AI
+          # review  -> run the AI sanity check (subject to the diff budget below)
+          if [ "$HAS_HOTFIX" = "true" ]; then
+            mode=hotfix
+          elif { [ "$ACTION" = "labeled" ] || [ "$ACTION" = "unlabeled" ]; } && [ "$EVENT_LABEL" != "hotfix" ]; then
+            mode=mirror
+          else
+            mode=review
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "Sanity mode: $mode (action=$ACTION label=${EVENT_LABEL:-none} hotfix=$HAS_HOTFIX)"
+
+      - name: Hotfix override
+        if: steps.mode.outputs.mode == 'hotfix'
+        run: |
+          marker='<!-- ssdlc-hotfix -->'
+          existing=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq "[.[] | select(.body | contains(\"$marker\"))] | length" | awk '{s+=$1} END {print s+0}')
+          if [ "$existing" -eq 0 ]; then
+            body="$marker
+          **Hotfix override applied.** The \`hotfix\` label skips the AI sanity check so this PR is not blocked.
+
+          Per the SSDLC policy, please, within **2 business days**:
+          1. Reply on this PR with a short justification for bypassing the normal review.
+          2. File a follow-up bead (\`bd create ...\`) for any review, tests or cleanup that were skipped, and link it here."
+            gh pr comment "$PR" --repo "$REPO" --body "$body"
+          else
+            echo "Hotfix comment already present; not posting again."
+          fi
+          echo "::notice title=SSDLC sanity::hotfix label present - check passes without AI review"
+
+      - name: Mirror previous verdict (non-hotfix label change)
+        if: steps.mode.outputs.mode == 'mirror'
+        id: mirror
+        run: |
+          # A label unrelated to hotfix changed. Do not re-run the AI. Re-report
+          # the most recent completed sanity verdict on this commit so adding a
+          # random label can never turn a BLOCK green.
+          last=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100" \
+            --jq '[.check_runs[] | select((.name == "sanity" or (.name | endswith("/ sanity"))) and (.conclusion == "success" or .conclusion == "failure"))] | sort_by(.completed_at) | last | .conclusion // ""')
+          echo "Previous sanity conclusion on $HEAD_SHA: ${last:-none}"
+          if [ "$last" = "failure" ]; then
+            echo "::error title=SSDLC sanity::previous sanity check on this commit failed (BLOCK); a label change does not clear it"
+            exit 1
+          elif [ "$last" = "success" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No previous verdict on this commit; running the review."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Diff budget
+        id: go
+        if: steps.mode.outputs.mode == 'review' || (steps.mode.outputs.mode == 'mirror' && steps.mirror.outputs.found == 'false')
+        run: |
+          changed=$(( ${ADDITIONS:-0} + ${DELETIONS:-0} ))
+          if [ "$changed" -gt "$MAX_CHANGED_LINES" ]; then
+            echo "::notice title=SSDLC sanity::diff is $changed changed lines (> $MAX_CHANGED_LINES); AI sanity check skipped, check passes"
+            echo "review=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Diff is $changed changed lines; running the review."
+            echo "review=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Require ANTHROPIC_API_KEY
+        if: steps.go.outputs.review == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error title=SSDLC sanity::ANTHROPIC_API_KEY secret is empty or not visible to $REPO. Set it as a repo secret (org secrets do not reach private repos on the GitHub Free plan) and make sure the caller passes 'secrets: inherit'. Add the 'hotfix' label to bypass."
+            exit 1
+          fi
+
+      - name: Checkout PR
+        if: steps.go.outputs.review == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve prompt
+        if: steps.go.outputs.review == 'true'
+        id: prompt_file
+        uses: quonfig/ci/.github/actions/sanity-prompt@main
+
+      - name: Build prompt and diff
+        if: steps.go.outputs.review == 'true'
+        id: prompt
+        env:
+          PROMPT_FILE: ${{ steps.prompt_file.outputs.path }}
+          PROMPT_SOURCE: ${{ steps.prompt_file.outputs.source }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/ssdlc"
+          # Inside the workspace so Claude's Read tool can open it.
+          diff_file="$GITHUB_WORKSPACE/.ssdlc-pr.diff"
+          gh pr diff "$PR" --repo "$REPO" > "$diff_file"
+          # Hard byte cap as a second budget guard (huge lockfile/generated lines).
+          if [ "$(wc -c < "$diff_file")" -gt 200000 ]; then
+            head -c 200000 "$diff_file" > "$diff_file.tmp" && mv "$diff_file.tmp" "$diff_file"
+            printf '\n[diff truncated at 200000 bytes]\n' >> "$diff_file"
+          fi
+          echo "Prompt source: $PROMPT_SOURCE ($PROMPT_FILE)"
+          {
+            echo 'prompt<<SSDLC_PROMPT_EOF'
+            cat "$PROMPT_FILE"
+            echo
+            echo "---"
+            echo "Repository: $REPO, pull request #$PR."
+            echo "The full unified diff is at: $diff_file"
+            echo "Read that file first. You may open other files in the checked-out repo for context, but stay brief."
+            echo "Do not post comments or edit files. Write your review as your final answer in GitHub markdown,"
+            echo "and make the very last line exactly one of: VERDICT: PASS, VERDICT: WARN, VERDICT: BLOCK"
+            echo 'SSDLC_PROMPT_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Claude sanity check
+        if: steps.go.outputs.review == 'true'
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          prompt: ${{ steps.prompt.outputs.prompt }}
+          claude_args: >-
+            --model ${{ inputs.model }}
+            --max-turns ${{ inputs.max_turns }}
+            --allowedTools Read,Grep,Glob
+
+      - name: Post findings and apply verdict
+        if: steps.go.outputs.review == 'true'
+        env:
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+          MODEL: ${{ inputs.model }}
+        run: |
+          review=$(jq -r '[.[] | select(.type == "result")] | last | .result // ""' "$EXECUTION_FILE")
+          verdict=$(printf '%s\n' "$review" | grep -oE 'VERDICT: (PASS|WARN|BLOCK)' | tail -n1 | awk '{print $2}')
+          verdict=${verdict:-UNKNOWN}
+          marker='<!-- ssdlc-sanity -->'
+          body_file="$RUNNER_TEMP/ssdlc/comment.md"
+          {
+            echo "$marker"
+            echo "### SSDLC sanity check: \`$verdict\`"
+            echo
+            if [ -n "$review" ]; then printf '%s\n' "$review"; else echo "_The model returned no review text._"; fi
+            echo
+            echo "<sub>Model: $MODEL, commit ${HEAD_SHA:0:7}. Only BLOCK fails this check. Add the \`hotfix\` label to override.</sub>"
+          } > "$body_file"
+          # One sticky comment per PR: update in place instead of piling up.
+          comment_id=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n1)
+          if [ -n "$comment_id" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$comment_id" -F "body=@$body_file" > /dev/null
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -F "body=@$body_file" > /dev/null
+          fi
+          echo "Verdict: $verdict"
+          case "$verdict" in
+            BLOCK)
+              echo "::error title=SSDLC sanity::BLOCK verdict - see the PR comment. Fix, or add the 'hotfix' label to override."
+              exit 1 ;;
+            UNKNOWN)
+              echo "::warning title=SSDLC sanity::no verdict line found in the model output; passing" ;;
+            *)
+              echo "::notice title=SSDLC sanity::$verdict" ;;
+          esac

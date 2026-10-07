@@ -1,0 +1,19 @@
+# Gates quonfig/ci's own PRs with the same SSDLC checks every other repo uses.
+# Other repos use the identical file but with
+#   uses: quonfig/ci/.github/workflows/ssdlc.yml@main
+name: ssdlc-pr
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  checks: read
+
+jobs:
+  ssdlc:
+    uses: ./.github/workflows/ssdlc.yml
+    secrets: inherit

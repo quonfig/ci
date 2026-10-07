@@ -1,0 +1,26 @@
+name: Resolve sanity prompt
+description: >
+  Picks the review prompt for the SSDLC sanity check. Uses the calling repo's
+  .github/claude-sanity-prompt.md when present, otherwise the default prompt.md
+  shipped next to this action in quonfig/ci.
+outputs:
+  path:
+    description: Absolute path of the prompt file to use
+    value: ${{ steps.resolve.outputs.path }}
+  source:
+    description: "'repo' or 'default'"
+    value: ${{ steps.resolve.outputs.source }}
+runs:
+  using: composite
+  steps:
+    - id: resolve
+      shell: bash
+      run: |
+        repo_prompt="$GITHUB_WORKSPACE/.github/claude-sanity-prompt.md"
+        if [ -s "$repo_prompt" ]; then
+          echo "path=$repo_prompt" >> "$GITHUB_OUTPUT"
+          echo "source=repo" >> "$GITHUB_OUTPUT"
+        else
+          echo "path=$GITHUB_ACTION_PATH/prompt.md" >> "$GITHUB_OUTPUT"
+          echo "source=default" >> "$GITHUB_OUTPUT"
+        fi
