@@ -127,16 +127,51 @@ jobs:
             echo "found=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Diff budget
+      - name: Fetch diff, strip lockfiles/generated files, apply budget
         id: go
         if: steps.mode.outputs.mode == 'review' || (steps.mode.outputs.mode == 'mirror' && steps.mirror.outputs.found == 'false')
         run: |
-          changed=$(( ${ADDITIONS:-0} + ${DELETIONS:-0} ))
-          if [ "$changed" -gt "$MAX_CHANGED_LINES" ]; then
-            echo "::notice title=SSDLC sanity::diff is $changed changed lines (> $MAX_CHANGED_LINES); AI sanity check skipped, check passes"
+          dir="$RUNNER_TEMP/ssdlc"
+          mkdir -p "$dir"
+          raw="$dir/raw.diff"
+          raw_changed=$(( ${ADDITIONS:-0} + ${DELETIONS:-0} ))
+          if ! gh pr diff "$PR" --repo "$REPO" > "$raw" 2> "$dir/diff.err"; then
+            cat "$dir/diff.err"
+            echo "::notice title=SSDLC sanity::could not fetch the PR diff (usually too large for the GitHub diff API; $raw_changed changed lines); AI sanity check skipped, check passes"
+            echo "review=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Lockfiles and generated files are noise for a sanity review and
+          # blow the model's turn budget (qfg-30x6). They stay covered by the
+          # deps job. Matching is on the file's basename.
+          awk -v skipped="$dir/skipped.txt" -v countfile="$dir/count.txt" '
+            function gen(p,  b) {
+              b = p; sub(/.*\//, "", b)
+              return (b ~ /^(package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|go\.sum|poetry\.lock|Gemfile\.lock|Package\.resolved|packages\.lock\.json|bun\.lockb)$/ \
+                || b ~ /\.lock$/ || b ~ /\.min\.(js|css)$/ || b ~ /\.(js|css)\.map$/)
+            }
+            /^diff --git / { p = $0; sub(/^diff --git a\/.* b\//, "", p); skip = gen(p); inhunk = 0; if (skip) print p > skipped }
+            skip { next }
+            { print }
+            /^@@/ { inhunk = 1; next }
+            inhunk && /^[+-]/ { n++ }
+            END { print n + 0 > countfile }
+          ' "$raw" > "$dir/pr.diff"
+          changed=$(cat "$dir/count.txt")
+          omitted=0
+          if [ -s "$dir/skipped.txt" ]; then
+            omitted=$(wc -l < "$dir/skipped.txt" | tr -d ' ')
+            echo "Omitted $omitted lockfile/generated file(s) from the AI diff:"
+            cat "$dir/skipped.txt"
+          fi
+          if [ "$changed" -eq 0 ]; then
+            echo "::notice title=SSDLC sanity::no reviewable changed lines ($omitted lockfile/generated file(s) omitted); AI sanity check skipped, check passes"
+            echo "review=false" >> "$GITHUB_OUTPUT"
+          elif [ "$changed" -gt "$MAX_CHANGED_LINES" ]; then
+            echo "::notice title=SSDLC sanity::diff is $changed reviewable changed lines (> $MAX_CHANGED_LINES); AI sanity check skipped, check passes"
             echo "review=false" >> "$GITHUB_OUTPUT"
           else
-            echo "Diff is $changed changed lines; running the review."
+            echo "Reviewable diff: $changed changed lines ($raw_changed raw, $omitted file(s) omitted); running the review."
             echo "review=true" >> "$GITHUB_OUTPUT"
           fi
 
@@ -169,11 +204,11 @@ jobs:
           PROMPT_FILE: ${{ steps.prompt_file.outputs.path }}
           PROMPT_SOURCE: ${{ steps.prompt_file.outputs.source }}
         run: |
-          mkdir -p "$RUNNER_TEMP/ssdlc"
-          # Inside the workspace so Claude's Read tool can open it.
+          # Inside the workspace so Claude's Read tool can open it. Copied after
+          # checkout, which would otherwise clean it away.
           diff_file="$GITHUB_WORKSPACE/.ssdlc-pr.diff"
-          gh pr diff "$PR" --repo "$REPO" > "$diff_file"
-          # Hard byte cap as a second budget guard (huge lockfile/generated lines).
+          cp "$RUNNER_TEMP/ssdlc/pr.diff" "$diff_file"
+          # Hard byte cap as a second budget guard (huge generated lines).
           if [ "$(wc -c < "$diff_file")" -gt 200000 ]; then
             head -c 200000 "$diff_file" > "$diff_file.tmp" && mv "$diff_file.tmp" "$diff_file"
             printf '\n[diff truncated at 200000 bytes]\n' >> "$diff_file"
@@ -186,6 +221,10 @@ jobs:
             echo "---"
             echo "Repository: $REPO, pull request #$PR."
             echo "The full unified diff is at: $diff_file"
+            if [ -s "$RUNNER_TEMP/ssdlc/skipped.txt" ]; then
+              echo "Lockfiles and generated files were removed from that diff (dependency changes are scanned by a separate job):"
+              head -n 50 "$RUNNER_TEMP/ssdlc/skipped.txt" | sed 's/^/- /'
+            fi
             echo "Read that file first. You may open other files in the checked-out repo for context, but stay brief."
             echo "Do not post comments or edit files. Write your review as your final answer in GitHub markdown,"
             echo "and make the very last line exactly one of: VERDICT: PASS, VERDICT: WARN, VERDICT: BLOCK"
@@ -195,6 +234,9 @@ jobs:
       - name: Claude sanity check
         if: steps.go.outputs.review == 'true'
         id: claude
+        # An AI/infrastructure failure (error_max_turns, API outage, ...) must
+        # not fail the gate: the next step turns it into a WARN (qfg-30x6).
+        continue-on-error: true
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -209,10 +251,24 @@ jobs:
         if: steps.go.outputs.review == 'true'
         env:
           EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+          CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
           MODEL: ${{ inputs.model }}
         run: |
-          review=$(jq -r '[.[] | select(.type == "result")] | last | .result // ""' "$EXECUTION_FILE")
-          verdict=$(printf '%s\n' "$review" | grep -oE 'VERDICT: (PASS|WARN|BLOCK)' | tail -n1 | awk '{print $2}')
+          review=""
+          subtype=""
+          if [ -n "$EXECUTION_FILE" ] && [ -s "$EXECUTION_FILE" ]; then
+            review=$(jq -r '[.[] | select(.type == "result")] | last | .result // ""' "$EXECUTION_FILE" 2>/dev/null || true)
+            subtype=$(jq -r '[.[] | select(.type == "result")] | last | .subtype // ""' "$EXECUTION_FILE" 2>/dev/null || true)
+          fi
+          verdict=$(printf '%s\n' "$review" | grep -oE 'VERDICT: (PASS|WARN|BLOCK)' | tail -n1 | awk '{print $2}' || true)
+          incomplete=""
+          if [ "$verdict" != "BLOCK" ] && [ "$CLAUDE_OUTCOME" != "success" ]; then
+            # Only an explicit BLOCK fails. A run that did not finish
+            # (error_max_turns, API error, ...) is an AI infrastructure
+            # problem, reported as a non-blocking WARN (qfg-30x6).
+            incomplete="${subtype:-claude-code-action $CLAUDE_OUTCOME}"
+            verdict=WARN
+          fi
           verdict=${verdict:-UNKNOWN}
           marker='<!-- ssdlc-sanity -->'
           body_file="$RUNNER_TEMP/ssdlc/comment.md"
@@ -220,13 +276,19 @@ jobs:
             echo "$marker"
             echo "### SSDLC sanity check: \`$verdict\`"
             echo
-            if [ -n "$review" ]; then printf '%s\n' "$review"; else echo "_The model returned no review text._"; fi
+            if [ -n "$incomplete" ]; then
+              echo "_The AI sanity check did not complete (\`$incomplete\`). This is an AI infrastructure issue, not a finding, so the check passes. Re-run the job for a review._"
+            elif [ -n "$review" ]; then
+              printf '%s\n' "$review"
+            else
+              echo "_The model returned no review text._"
+            fi
             echo
             echo "<sub>Model: $MODEL, commit ${HEAD_SHA:0:7}. Only BLOCK fails this check. Add the \`hotfix\` label to override.</sub>"
           } > "$body_file"
           # One sticky comment per PR: update in place instead of piling up.
           comment_id=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
-            --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n1)
+            --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n1 || true)
           if [ -n "$comment_id" ]; then
             gh api -X PATCH "repos/$REPO/issues/comments/$comment_id" -F "body=@$body_file" > /dev/null
           else
@@ -240,7 +302,11 @@ jobs:
             UNKNOWN)
               echo "::warning title=SSDLC sanity::no verdict line found in the model output; passing" ;;
             *)
-              echo "::notice title=SSDLC sanity::$verdict" ;;
+              if [ -n "$incomplete" ]; then
+                echo "::warning title=SSDLC sanity::AI sanity check did not complete ($incomplete); non-blocking WARN, check passes. Re-run the job for a review."
+              else
+                echo "::notice title=SSDLC sanity::$verdict"
+              fi ;;
           esac
 
   secrets:
