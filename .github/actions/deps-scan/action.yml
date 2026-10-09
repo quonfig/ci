@@ -43,7 +43,11 @@ runs:
           "https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/osv-scanner_linux_amd64"
         echo "${OSV_SHA256}  $dir/osv-scanner" | sha256sum -c -
         chmod +x "$dir/osv-scanner"
-        "$dir/osv-scanner" --version | head -n1
+        # No pipe into head: under pipefail, head exiting early SIGPIPEs
+        # osv-scanner and fails the step with exit 141 (qfg-66ko.13). A real
+        # failure of the binary still fails the step via set -e.
+        ver=$("$dir/osv-scanner" --version)
+        echo "${ver%%$'\n'*}"
         echo "OSV_BIN=$dir/osv-scanner" >> "$GITHUB_ENV"
 
     - name: Scan and apply policy
