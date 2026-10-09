@@ -3,8 +3,9 @@
 Shared CI for the Quonfig org: the SSDLC pull-request gate required by the
 SOC 2 Secure Software Development Lifecycle policy (epic `qfg-66ko`).
 
-This repo is private. Its Actions access level is **organization**, so any
-quonfig repo can call its reusable workflows and composite actions.
+This repo is public, so every quonfig repo, public or private, can call its
+reusable workflows and composite actions (a public repo cannot call a private
+repo's workflows). It holds no secrets: callers pass `ANTHROPIC_API_KEY` in.
 
 ## How repos use it
 
@@ -79,6 +80,18 @@ A cheap, basic check, not a full code review.
 - If `ANTHROPIC_API_KEY` is empty or not visible to the repo, the check fails
   with a clear message rather than silently passing. On the GitHub Free plan
   org secrets do not reach private repos, so private repos need a repo secret.
+- **Dependabot PRs**: runs triggered by Dependabot (`github.actor ==
+  dependabot[bot]`) get only Dependabot secrets, never Actions secrets, so the
+  AI cannot run. The check is skipped and passes with a notice. The dependency
+  change is still gated by the `deps` (osv-scanner), `secrets` (gitleaks) and
+  `sast` (Semgrep) jobs. If a human pushes a commit to the Dependabot branch,
+  that run is a normal AI review.
+- **Fork PRs** (public repos): GitHub never passes secrets to `pull_request`
+  runs from a fork, so the check fails with a message saying so. A maintainer
+  reviews the PR by hand, then adds the `hotfix` label to pass the check (and
+  posts the justification the hotfix comment asks for). On a fork PR the
+  token is read-only, so if the hotfix comment cannot be posted the job warns
+  instead of failing.
 
 Inputs (all optional): `max_changed_lines` (3000), `model`, `max_turns` (6).
 
@@ -274,6 +287,6 @@ For each PR, confirm the justification comment and follow-up bead exist.
 - Callers pin `@main`. A change merged here takes effect on the next PR event
   in every repo. The composite action is also referenced at `@main`, so prompt
   changes in a ci PR only take effect after merge.
-- `.github/actions/sanity-prompt` exists because a caller's `GITHUB_TOKEN`
-  cannot check out this private repo; composite actions are downloaded with the
-  whole repo, which makes the default `prompt.md` reachable.
+- `.github/actions/sanity-prompt` exists so the default `prompt.md` ships
+  with the workflow: composite actions are downloaded with the whole repo, so
+  the caller never has to check out quonfig/ci itself.

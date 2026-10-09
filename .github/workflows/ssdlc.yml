@@ -68,6 +68,8 @@ jobs:
       ACTION: ${{ github.event.action }}
       EVENT_LABEL: ${{ github.event.label.name }}
       HAS_HOTFIX: ${{ contains(github.event.pull_request.labels.*.name, 'hotfix') }}
+      ACTOR: ${{ github.actor }}
+      HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
       ADDITIONS: ${{ github.event.pull_request.additions }}
       DELETIONS: ${{ github.event.pull_request.deletions }}
       MAX_CHANGED_LINES: ${{ inputs.max_changed_lines }}
@@ -75,18 +77,22 @@ jobs:
       - name: Decide mode
         id: mode
         run: |
-          # hotfix  -> pass, post the justification request once
-          # mirror  -> a non-hotfix label changed: re-report the last verdict, no AI
-          # review  -> run the AI sanity check (subject to the diff budget below)
+          # hotfix     -> pass, post the justification request once
+          # dependabot -> pass with a notice: Dependabot-triggered runs get no
+          #               Actions secrets, so the AI cannot run (qfg-66ko.14)
+          # mirror     -> a non-hotfix label changed: re-report the last verdict, no AI
+          # review     -> run the AI sanity check (subject to the diff budget below)
           if [ "$HAS_HOTFIX" = "true" ]; then
             mode=hotfix
+          elif [ "$ACTOR" = "dependabot[bot]" ]; then
+            mode=dependabot
           elif { [ "$ACTION" = "labeled" ] || [ "$ACTION" = "unlabeled" ]; } && [ "$EVENT_LABEL" != "hotfix" ]; then
             mode=mirror
           else
             mode=review
           fi
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
-          echo "Sanity mode: $mode (action=$ACTION label=${EVENT_LABEL:-none} hotfix=$HAS_HOTFIX)"
+          echo "Sanity mode: $mode (action=$ACTION label=${EVENT_LABEL:-none} hotfix=$HAS_HOTFIX actor=$ACTOR)"
 
       - name: Hotfix override
         if: steps.mode.outputs.mode == 'hotfix'
@@ -101,11 +107,22 @@ jobs:
           Per the SSDLC policy, please, within **2 business days**:
           1. Reply on this PR with a short justification for bypassing the normal review.
           2. File a follow-up bead (\`bd create ...\`) for any review, tests or cleanup that were skipped, and link it here."
-            gh pr comment "$PR" --repo "$REPO" --body "$body"
+            # Fork PRs get a read-only token; the override must still pass.
+            gh pr comment "$PR" --repo "$REPO" --body "$body" ||
+              echo "::warning title=SSDLC sanity::could not post the hotfix comment (read-only token on a fork PR?); post the justification by hand"
           else
             echo "Hotfix comment already present; not posting again."
           fi
           echo "::notice title=SSDLC sanity::hotfix label present - check passes without AI review"
+
+      - name: Dependabot PR
+        if: steps.mode.outputs.mode == 'dependabot'
+        run: |
+          # Runs triggered by Dependabot only see Dependabot secrets, never
+          # Actions secrets, so ANTHROPIC_API_KEY is unavailable. A dependency
+          # bump is still gated by the deps, secrets and sast jobs. A human
+          # pushing to the branch triggers a normal AI review.
+          echo "::notice title=SSDLC sanity::Dependabot PR - AI sanity check skipped (Dependabot runs get no Actions secrets), check passes. The dependency change is still covered by the deps (osv-scanner), secrets (gitleaks) and sast (Semgrep) jobs."
 
       - name: Mirror previous verdict (non-hotfix label change)
         if: steps.mode.outputs.mode == 'mirror'
@@ -180,6 +197,11 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
+          if [ -z "$ANTHROPIC_API_KEY" ] && [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$REPO" ]; then
+            # pull_request runs from forks never receive secrets, by design.
+            echo "::error title=SSDLC sanity::PR from fork $HEAD_REPO - the AI sanity check cannot run because GitHub does not pass secrets to fork PRs. A maintainer must review this PR by hand and then add the 'hotfix' label to pass this check (and post the justification it asks for)."
+            exit 1
+          fi
           if [ -z "$ANTHROPIC_API_KEY" ]; then
             echo "::error title=SSDLC sanity::ANTHROPIC_API_KEY secret is empty or not visible to $REPO. Set it as a repo secret (org secrets do not reach private repos on the GitHub Free plan) and make sure the caller passes 'secrets: inherit'. Add the 'hotfix' label to bypass."
             exit 1
