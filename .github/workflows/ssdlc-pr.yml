@@ -22,5 +22,3 @@ jobs:
     with:
       # quonfig/ci has no dependency manifests to scan.
       deps: false
-      # THROWAWAY (qfg-30x6 verification, do not merge): force error_max_turns.
-      max_turns: 1
