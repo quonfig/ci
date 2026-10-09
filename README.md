@@ -56,9 +56,22 @@ A cheap, basic check, not a full code review.
 - Findings go to one sticky PR comment, updated in place on each run.
 - **Only `VERDICT: BLOCK` fails the check.** WARN and PASS pass. A missing
   verdict line passes with a warning annotation.
+- AI infrastructure failures never fail the check: if the model run does not
+  finish (`error_max_turns`, an API error, ...) the check passes as a
+  non-blocking `WARN` with a warning annotation and a sticky comment saying so.
+  Re-run the job for a real review.
 - Draft PRs are skipped. Marking the PR ready for review runs the check.
-- Budget guard: diffs over 3000 changed lines (additions + deletions) skip the
-  AI and pass with a notice. The diff handed to the model is also capped at
+- Lockfiles and generated files are stripped from the diff before it reaches
+  the model (`package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`,
+  `yarn.lock`, `go.sum`, `poetry.lock`, `Gemfile.lock`, any `*.lock`,
+  `Package.resolved`, `packages.lock.json`, `bun.lockb`, `*.min.js`,
+  `*.min.css`, `*.js.map`, `*.css.map`; matched on the file name). The prompt
+  lists what was omitted. Dependency changes stay covered by the `deps` job.
+  If nothing reviewable remains (a lockfile-only or empty diff) the AI is
+  skipped and the check passes with a notice.
+- Budget guard: more than 3000 reviewable changed lines (counted after
+  stripping) skips the AI and passes with a notice, as does a diff too large
+  for the GitHub diff API. The diff handed to the model is also capped at
   200 KB.
 - Label changes: adding or removing a label other than `hotfix` does **not**
   re-run the AI. The job re-reports the last sanity verdict on the same commit
