@@ -7,6 +7,9 @@
 #   deps    - osv-scanner HIGH/CRITICAL dependency vulnerability scan
 #   sast    - Semgrep CE p/ci static analysis, ERROR severity only, diff-aware
 #
+# Overrides: `hotfix` relaxes every job; `ssdlc-approved` (human-applied) passes
+# the sanity job only, for the head commit it was applied on.
+#
 # Required check names in a caller whose job id is `ssdlc`:
 #   "ssdlc / sanity", "ssdlc / secrets", "ssdlc / deps", "ssdlc / sast".
 name: ssdlc
@@ -65,10 +68,13 @@ jobs:
       REPO: ${{ github.repository }}
       PR: ${{ github.event.pull_request.number }}
       HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
       ACTION: ${{ github.event.action }}
       EVENT_LABEL: ${{ github.event.label.name }}
       HAS_HOTFIX: ${{ contains(github.event.pull_request.labels.*.name, 'hotfix') }}
       ACTOR: ${{ github.actor }}
+      SENDER: ${{ github.event.sender.login }}
+      SENDER_TYPE: ${{ github.event.sender.type }}
       HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
       ADDITIONS: ${{ github.event.pull_request.additions }}
       DELETIONS: ${{ github.event.pull_request.deletions }}
@@ -80,19 +86,27 @@ jobs:
           # hotfix     -> pass, post the justification request once
           # dependabot -> pass with a notice: Dependabot-triggered runs get no
           #               Actions secrets, so the AI cannot run (qfg-66ko.14)
-          # mirror     -> a non-hotfix label changed: re-report the last verdict, no AI
+          # approved   -> `ssdlc-approved` was just added: pass on this head
+          #               commit only and post the attribution comment. The
+          #               approval lives only in this run's check result: any
+          #               later push is a normal review, and removing the label
+          #               re-runs the review (like hotfix).
+          # mirror     -> another label changed: re-report the last verdict, no AI
           # review     -> run the AI sanity check (subject to the diff budget below)
           if [ "$HAS_HOTFIX" = "true" ]; then
             mode=hotfix
           elif [ "$ACTOR" = "dependabot[bot]" ]; then
             mode=dependabot
-          elif { [ "$ACTION" = "labeled" ] || [ "$ACTION" = "unlabeled" ]; } && [ "$EVENT_LABEL" != "hotfix" ]; then
+          elif [ "$ACTION" = "labeled" ] && [ "$EVENT_LABEL" = "ssdlc-approved" ]; then
+            mode=approved
+          elif { [ "$ACTION" = "labeled" ] || [ "$ACTION" = "unlabeled" ]; } \
+              && [ "$EVENT_LABEL" != "hotfix" ] && [ "$EVENT_LABEL" != "ssdlc-approved" ]; then
             mode=mirror
           else
             mode=review
           fi
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
-          echo "Sanity mode: $mode (action=$ACTION label=${EVENT_LABEL:-none} hotfix=$HAS_HOTFIX actor=$ACTOR)"
+          echo "Sanity mode: $mode (action=$ACTION label=${EVENT_LABEL:-none} hotfix=$HAS_HOTFIX actor=$ACTOR sender=$SENDER)"
 
       - name: Hotfix override
         if: steps.mode.outputs.mode == 'hotfix'
@@ -115,6 +129,40 @@ jobs:
           fi
           echo "::notice title=SSDLC sanity::hotfix label present - check passes without AI review"
 
+      - name: ssdlc-approved override (sanity only)
+        if: steps.mode.outputs.mode == 'approved'
+        run: |
+          # A human read the AI finding and accepts the PR. Only this job is
+          # relaxed; secrets, deps and sast still enforce. The pass is tied to
+          # $HEAD_SHA: a later push runs the AI again, and if that BLOCKs the
+          # label must be removed and re-added to approve the new commit.
+          if [ "$SENDER_TYPE" = "Bot" ]; then
+            echo "::error title=SSDLC sanity::ssdlc-approved was added by $SENDER, a bot. Only a human may apply this override."
+            exit 1
+          fi
+          marker='<!-- ssdlc-approved -->'
+          body="$marker
+          AI sanity finding overridden by @$SENDER via \`ssdlc-approved\` on $HEAD_SHA
+
+          <sub>Sanity check only: secrets, deps and sast still enforce. The approval covers this commit; a new push re-runs the AI review.</sub>"
+          comment_id=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq ".[] | select(.body | startswith(\"$marker\")) | .id" | head -n1 || true)
+          if [ -n "$comment_id" ]; then
+            ok=$(gh api -X PATCH "repos/$REPO/issues/comments/$comment_id" -f "body=$body" > /dev/null && echo yes || true)
+          else
+            ok=$(gh api -X POST "repos/$REPO/issues/$PR/comments" -f "body=$body" > /dev/null && echo yes || true)
+          fi
+          if [ "$ok" != "yes" ]; then
+            if [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$REPO" ]; then
+              # Fork PRs get a read-only token; the human override must still pass.
+              echo "::warning title=SSDLC sanity::could not post the ssdlc-approved attribution comment (read-only token on a fork PR); record the approval on the PR by hand"
+            else
+              echo "::error title=SSDLC sanity::could not post the ssdlc-approved attribution comment (the audit evidence); re-run the job"
+              exit 1
+            fi
+          fi
+          echo "::notice title=SSDLC sanity::ssdlc-approved by $SENDER on ${HEAD_SHA:0:7} - sanity check passes without AI review"
+
       - name: Dependabot PR
         if: steps.mode.outputs.mode == 'dependabot'
         run: |
@@ -128,7 +176,7 @@ jobs:
         if: steps.mode.outputs.mode == 'mirror'
         id: mirror
         run: |
-          # A label unrelated to hotfix changed. Do not re-run the AI. Re-report
+          # A label other than hotfix/ssdlc-approved changed. Do not re-run the AI. Re-report
           # the most recent completed sanity verdict on this commit so adding a
           # random label can never turn a BLOCK green.
           last=$(gh api "repos/$REPO/commits/$HEAD_SHA/check-runs?per_page=100" \
@@ -199,7 +247,7 @@ jobs:
         run: |
           if [ -z "$ANTHROPIC_API_KEY" ] && [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$REPO" ]; then
             # pull_request runs from forks never receive secrets, by design.
-            echo "::error title=SSDLC sanity::PR from fork $HEAD_REPO - the AI sanity check cannot run because GitHub does not pass secrets to fork PRs. A maintainer must review this PR by hand and then add the 'hotfix' label to pass this check (and post the justification it asks for)."
+            echo "::error title=SSDLC sanity::PR from fork $HEAD_REPO - the AI sanity check cannot run because GitHub does not pass secrets to fork PRs. A maintainer must review this PR by hand and then add the 'ssdlc-approved' label to pass this check."
             exit 1
           fi
           if [ -z "$ANTHROPIC_API_KEY" ]; then
@@ -218,6 +266,10 @@ jobs:
         if: steps.go.outputs.review == 'true'
         id: prompt_file
         uses: quonfig/ci/.github/actions/sanity-prompt@main
+        with:
+          repo: ${{ github.repository }}
+          base_sha: ${{ github.event.pull_request.base.sha }}
+          token: ${{ github.token }}
 
       - name: Build prompt and diff
         if: steps.go.outputs.review == 'true'
@@ -273,6 +325,7 @@ jobs:
         if: steps.go.outputs.review == 'true'
         env:
           EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+          PROMPT_SOURCE: ${{ steps.prompt_file.outputs.source }}
           CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
           MODEL: ${{ inputs.model }}
         run: |
@@ -306,7 +359,7 @@ jobs:
               echo "_The model returned no review text._"
             fi
             echo
-            echo "<sub>Model: $MODEL, commit ${HEAD_SHA:0:7}. Only BLOCK fails this check. Add the \`hotfix\` label to override.</sub>"
+            echo "<sub>Model: $MODEL, commit ${HEAD_SHA:0:7}, prompt $PROMPT_SOURCE. Only BLOCK fails this check. To override a BLOCK after reading it, a human adds \`ssdlc-approved\` (sanity check only, this commit only) or, in an emergency, \`hotfix\` (all checks, needs a justification and follow-up bead).</sub>"
           } > "$body_file"
           # One sticky comment per PR: update in place instead of piling up.
           comment_id=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
@@ -319,7 +372,7 @@ jobs:
           echo "Verdict: $verdict"
           case "$verdict" in
             BLOCK)
-              echo "::error title=SSDLC sanity::BLOCK verdict - see the PR comment. Fix, or add the 'hotfix' label to override."
+              echo "::error title=SSDLC sanity::BLOCK verdict - see the PR comment. Fix it, or a human adds the 'ssdlc-approved' label (sanity only) or 'hotfix' (emergency) to override."
               exit 1 ;;
             UNKNOWN)
               echo "::warning title=SSDLC sanity::no verdict line found in the model output; passing" ;;
