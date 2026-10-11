@@ -49,11 +49,20 @@ A cheap, basic check, not a full code review.
 
 - Model `claude-haiku-4-5-20251001`, at most 6 turns, read-only tools
   (`Read, Grep, Glob`), via `anthropics/claude-code-action@v1`.
-- Prompt: the calling repo's `.github/claude-sanity-prompt.md` if present,
+- Prompt: the calling repo's `.github/claude-sanity-prompt.md` **as it is on
+  the PR's base commit** (`pull_request.base.sha`, read via the contents API),
   otherwise the default
   [`.github/actions/sanity-prompt/prompt.md`](.github/actions/sanity-prompt/prompt.md).
-  The workflow appends the fixed output contract (diff location, last line
-  `VERDICT: PASS|WARN|BLOCK`), so a repo prompt only needs the review criteria.
+  Reading from the base means a PR can never rewrite its own review: a PR that
+  changes the prompt is reviewed by the old one, and the new prompt applies
+  from the next PR after merge. The workflow appends the fixed output contract
+  (diff location, last line `VERDICT: PASS|WARN|BLOCK`), so a repo prompt only
+  needs the review criteria. The sticky comment footer names the prompt used
+  (`repo@<base sha>` or `default`).
+- Version numbers and dependency floors are WARN at most, never BLOCK (house
+  policy, in every prompt): raising a dependency, peer-dependency, `engines` or
+  language-version floor, and patch vs minor vs major. Raising the floor of a
+  first-party Quonfig package within the same major is a patch or minor.
 - Findings go to one sticky PR comment, updated in place on each run.
 - **Only `VERDICT: BLOCK` fails the check.** WARN and PASS pass. A missing
   verdict line passes with a warning annotation.
@@ -74,9 +83,10 @@ A cheap, basic check, not a full code review.
   stripping) skips the AI and passes with a notice, as does a diff too large
   for the GitHub diff API. The diff handed to the model is also capped at
   200 KB.
-- Label changes: adding or removing a label other than `hotfix` does **not**
-  re-run the AI. The job re-reports the last sanity verdict on the same commit
-  (so adding an unrelated label cannot turn a BLOCK green).
+- Label changes: adding or removing a label other than `hotfix` or
+  `ssdlc-approved` does **not** re-run the AI. The job re-reports the last
+  sanity verdict on the same commit (so adding an unrelated label cannot turn
+  a BLOCK green). See [Overrides](#overrides) for those two labels.
 - If `ANTHROPIC_API_KEY` is empty or not visible to the repo, the check fails
   with a clear message rather than silently passing. On the GitHub Free plan
   org secrets do not reach private repos, so private repos need a repo secret.
@@ -88,10 +98,9 @@ A cheap, basic check, not a full code review.
   that run is a normal AI review.
 - **Fork PRs** (public repos): GitHub never passes secrets to `pull_request`
   runs from a fork, so the check fails with a message saying so. A maintainer
-  reviews the PR by hand, then adds the `hotfix` label to pass the check (and
-  posts the justification the hotfix comment asks for). On a fork PR the
-  token is read-only, so if the hotfix comment cannot be posted the job warns
-  instead of failing.
+  reviews the PR by hand, then adds the `ssdlc-approved` label to pass the
+  check. On a fork PR the token is read-only, so if the attribution comment
+  cannot be posted the job warns instead of failing.
 
 Inputs (all optional): `max_changed_lines` (3000), `model`, `max_turns` (6).
 
@@ -251,7 +260,37 @@ semgrep scan --config p/ci --metrics=off --baseline-commit "$(git merge-base ori
 semgrep scan --config p/ci --metrics=off --severity ERROR   # full scan
 ```
 
-## Hotfix override
+## Overrides
+
+Two labels override a failing check. Only a human applies either one, after
+reading the finding; agents never apply them.
+
+| Label | Relaxes | Scope | Follow-up |
+|-------|---------|-------|-----------|
+| `ssdlc-approved` | `sanity` only | the head commit it was added on | none; the attribution comment is the evidence |
+| `hotfix` | all four checks | every run while the label is on | justification comment + bead within 2 business days |
+
+### `ssdlc-approved`: accept an AI sanity finding
+
+Use it when the AI sanity check BLOCKs and a human disagrees with or accepts
+the finding (for example a judgment call the model got wrong).
+
+- Adding the label makes `ssdlc / sanity` pass on the PR's current head commit
+  without running the AI, and posts (or updates in place) one PR comment:
+  "AI sanity finding overridden by @<who added the label> via
+  `ssdlc-approved` on <full sha>". That comment is the audit evidence; no
+  follow-up bead is needed.
+- `secrets`, `deps` and `sast` are **not** relaxed.
+- The approval is tied to that commit. It only exists in the check result of
+  the run triggered by the `labeled` event. A new push runs the AI review
+  normally, even with the label still on. If that run BLOCKs, remove and
+  re-add the label to approve the new commit.
+- Removing the label re-runs the AI review, so the check is enforced again.
+- A label added by a bot account (`sender.type == Bot`) fails instead of
+  approving. Agents acting through a human's token are not detectable this
+  way; for them "humans only" is policy.
+
+### `hotfix`: emergency override
 
 Adding the `hotfix` label to a PR always overrides the gate: `sanity` passes
 without running the AI, and `secrets`, `deps` and `sast` report findings as
@@ -285,7 +324,8 @@ For each PR, confirm the justification comment and follow-up bead exist.
 ## Notes
 
 - Callers pin `@main`. A change merged here takes effect on the next PR event
-  in every repo. The composite action is also referenced at `@main`, so prompt
+  in every repo. Re-running a job does not pick up a change: it reuses the
+  workflow version of the original run. Push a commit, or close and reopen. The composite action is also referenced at `@main`, so prompt
   changes in a ci PR only take effect after merge.
 - `.github/actions/sanity-prompt` exists so the default `prompt.md` ships
   with the workflow: composite actions are downloaded with the whole repo, so

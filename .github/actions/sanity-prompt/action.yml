@@ -1,26 +1,53 @@
 name: Resolve sanity prompt
 description: >
   Picks the review prompt for the SSDLC sanity check. Uses the calling repo's
-  .github/claude-sanity-prompt.md when present, otherwise the default prompt.md
-  shipped next to this action in quonfig/ci.
+  .github/claude-sanity-prompt.md as it exists on the PR's BASE commit, so a PR
+  can never rewrite its own review. Falls back to the default prompt.md shipped
+  next to this action in quonfig/ci when the base has no such file.
+inputs:
+  repo:
+    description: owner/name of the calling repo
+    required: true
+  base_sha:
+    description: The pull request's base commit (github.event.pull_request.base.sha)
+    required: true
+  token:
+    description: Token that can read the repo's contents
+    required: true
 outputs:
   path:
     description: Absolute path of the prompt file to use
     value: ${{ steps.resolve.outputs.path }}
   source:
-    description: "'repo' or 'default'"
+    description: "'repo@<base sha>' or 'default'"
     value: ${{ steps.resolve.outputs.source }}
 runs:
   using: composite
   steps:
     - id: resolve
       shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ inputs.repo }}
+        BASE_SHA: ${{ inputs.base_sha }}
       run: |
-        repo_prompt="$GITHUB_WORKSPACE/.github/claude-sanity-prompt.md"
-        if [ -s "$repo_prompt" ]; then
-          echo "path=$repo_prompt" >> "$GITHUB_OUTPUT"
-          echo "source=repo" >> "$GITHUB_OUTPUT"
-        else
+        set -euo pipefail
+        out="$RUNNER_TEMP/ssdlc-base-prompt.md"
+        err="$RUNNER_TEMP/ssdlc-base-prompt.err"
+        # Read from the base commit, never the PR head: a PR that edits
+        # .github/claude-sanity-prompt.md is reviewed by the old prompt.
+        rc=0
+        gh api -H "Accept: application/vnd.github.raw" \
+          "repos/$REPO/contents/.github/claude-sanity-prompt.md?ref=$BASE_SHA" > "$out" 2> "$err" || rc=$?
+        if [ "$rc" -eq 0 ] && [ -s "$out" ]; then
+          echo "path=$out" >> "$GITHUB_OUTPUT"
+          echo "source=repo@${BASE_SHA:0:7}" >> "$GITHUB_OUTPUT"
+        elif [ "$rc" -eq 0 ] || grep -q "HTTP 404" "$err"; then
+          # No repo prompt on the base commit (or an empty one): use the default.
           echo "path=$GITHUB_ACTION_PATH/prompt.md" >> "$GITHUB_OUTPUT"
           echo "source=default" >> "$GITHUB_OUTPUT"
+        else
+          cat "$err"
+          echo "::error title=SSDLC sanity::could not read .github/claude-sanity-prompt.md at base $BASE_SHA; re-run the job"
+          exit 1
         fi
