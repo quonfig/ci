@@ -2,3 +2,4 @@
 -- Runs on deploy against the production database.
 DROP TABLE customers;
 DROP TABLE invoices;
+DROP TABLE payments;
