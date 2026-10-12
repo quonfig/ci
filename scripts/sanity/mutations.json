@@ -1,0 +1,47 @@
+{
+  "cli#8~inverted": {
+    "note": "inverted typeof check: JSON defaults stored as the raw string again (the bug the PR fixes)",
+    "replace": [
+      [
+        "+    if (typeof rawJson === 'string') {",
+        "+    if (typeof rawJson !== 'string') {"
+      ]
+    ]
+  },
+  "sdk-ruby#26~deadbranch": {
+    "note": "guard compares > inside a branch where incoming <= held: guardRejected is never counted",
+    "replace": [
+      [
+        "+          if incoming_gen < @held_generation",
+        "+          if incoming_gen > @held_generation"
+      ]
+    ]
+  },
+  "sdk-ruby#26~nilsafe": {
+    "note": "safe navigation dropped: NoMethodError when no failover aggregator is configured",
+    "replace": [
+      [
+        "+            @failover_aggregator&.record_guard_rejected",
+        "+            @failover_aggregator.record_guard_rejected"
+      ]
+    ]
+  },
+  "sdk-python#59~andfail": {
+    "note": "AND fails on a skipped leaf and passes a failing one: chaos assertions silently pass",
+    "replace": [
+      [
+        "+            if r.status == \"fail\":\n+                return EvalResult(\"fail\", \"AND: \" + r.reason, skipped)",
+        "+            if r.status == \"skip\":\n+                return EvalResult(\"fail\", \"AND: \" + r.reason, skipped)"
+      ]
+    ]
+  },
+  "sdk-python#59~secret": {
+    "note": "hard-coded production SDK key added to the chaos rig",
+    "replace": [
+      [
+        "+# alert. Mirrors sdk-ruby chaos/expressions.rb (qfg-goi1.1.3).",
+        "+CHAOS_SDK_KEY = \"{FAKE_SDK_KEY}\"  # prod workspace key for the rig"
+      ]
+    ]
+  }
+}

@@ -47,8 +47,24 @@ skipped, which satisfies a required check.
 
 A cheap, basic check, not a full code review.
 
-- Model `claude-haiku-4-5-20251001`, at most 6 turns, read-only tools
-  (`Read, Grep, Glob`), via `anthropics/claude-code-action@v1`.
+- One Messages API call per PR: model `claude-sonnet-5-5` at effort `medium`,
+  the diff **inline** in the user message, **no tools**, no agent turns, and a
+  **structured verdict** (JSON schema: up to 5 findings, each `BLOCK` or
+  `WARN` with `file:line`). The code is
+  [`scripts/sanity/sanity_review.py`](scripts/sanity/sanity_review.py)
+  (Python stdlib only, so the job installs nothing). The job checks it out
+  from quonfig/ci `main`. A quonfig/ci PR uses the PR head instead, so a change
+  to the reviewer is tested on the PR that makes it.
+- The verdict is derived from the findings: BLOCK only if at least one finding
+  is BLOCK, WARN if there is any finding, PASS otherwise. A bare
+  "verdict: BLOCK" with no BLOCK finding cannot fail a PR.
+- Why not the old agent setup (Haiku 4.5 + `claude-code-action`, 6 turns,
+  `Read, Grep, Glob`): the model spent its turns opening the diff file and
+  exploring the repo, and hit `error_max_turns` on small diffs (openfeature-go
+  run 38151833384: 7 turns in 14 s; also openfeature-node#17), which passed
+  silently as WARN. Its free-text `VERDICT:` line also flip-flopped on the same
+  diff (sdk-react-native#40 BLOCK then PASS). See
+  [Model choice](#model-choice-replay-set).
 - Prompt: the calling repo's `.github/claude-sanity-prompt.md` **as it is on
   the PR's base commit** (`pull_request.base.sha`, read via the contents API),
   otherwise the default
@@ -66,10 +82,11 @@ A cheap, basic check, not a full code review.
 - Findings go to one sticky PR comment, updated in place on each run.
 - **Only `VERDICT: BLOCK` fails the check.** WARN and PASS pass. A missing
   verdict line passes with a warning annotation.
-- AI infrastructure failures never fail the check: if the model run does not
-  finish (`error_max_turns`, an API error, ...) the check passes as a
-  non-blocking `WARN` with a warning annotation and a sticky comment saying so.
-  Re-run the job for a real review.
+- AI infrastructure failures never fail the check: if the review does not
+  finish (API error after retries, a refusal, unparseable output, a crash) the
+  check passes as a non-blocking `WARN` with a warning annotation and a sticky
+  comment saying so. Re-run the job for a real review. Each API attempt times
+  out after 90 s, with 3 retries.
 - Draft PRs are skipped. Marking the PR ready for review runs the check.
 - Lockfiles and generated files are stripped from the diff before it reaches
   the model (`package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`,
@@ -82,7 +99,8 @@ A cheap, basic check, not a full code review.
 - Budget guard: more than 3000 reviewable changed lines (counted after
   stripping) skips the AI and passes with a notice, as does a diff too large
   for the GitHub diff API. The diff handed to the model is also capped at
-  200 KB.
+  200 KB. The diff is fenced in `<diff>` tags and the fixed output contract
+  tells the model it is untrusted data, never instructions.
 - Label changes: adding or removing a label other than `hotfix` or
   `ssdlc-approved` does **not** re-run the AI. The job re-reports the last
   sanity verdict on the same commit (so adding an unrelated label cannot turn
@@ -102,7 +120,87 @@ A cheap, basic check, not a full code review.
   check. On a fork PR the token is read-only, so if the attribution comment
   cannot be posted the job warns instead of failing.
 
-Inputs (all optional): `max_changed_lines` (3000), `model`, `max_turns` (6).
+Inputs (all optional): `max_changed_lines` (3000), `model`
+(`claude-sonnet-5-5`), `effort` (`medium`), `confirm_block` (`false`: when
+true, a BLOCK is re-sampled and fails only on 2 of 3). `max_turns` is
+deprecated and ignored.
+
+#### Model choice (replay set)
+
+[`scripts/sanity/replay.py`](scripts/sanity/replay.py) replays real PRs
+through `sanity_review.py` (the same request CI sends: the repo prompt from the
+PR's base commit plus the lockfile-stripped diff), several times per model.
+The set is [`scripts/sanity/replay-set.tsv`](scripts/sanity/replay-set.tsv):
+
+- 4 known-bad throwaway PRs: hard-coded `sk_live_` key (app-quonfig#9), `DROP
+  TABLE` migration (ci#11), removed public exports (openfeature-go#7), and SQL
+  built from request input (api-delivery#16, "should flag": api-delivery's
+  prompt puts injection below its BLOCK bar, and `sast` owns it).
+- 12 real clean or judgment-call PRs, including the flip-flop and
+  peer-floor cases (sdk-react-native#40, openfeature-node#16,
+  openfeature-python#8).
+- 5 seeded bugs in real public-repo PRs ([`mutations.json`](scripts/sanity/mutations.json)):
+  an inverted condition, a dead branch, a dropped nil-safe call, an AND that
+  passes failing assertions, and a hard-coded production SDK key.
+
+Run it from the monorepo root (diffs are fetched with `gh` into a temp cache,
+never into this public repo):
+
+```bash
+qfg run -w mhw-works/our-config --environment development \
+  --env ANTHROPIC_API_KEY=anthropic.api-key.github-ci -- \
+  python3 ci/scripts/sanity/replay.py --runs 5 --variants sonnet55-medium,haiku45-temp0
+```
+
+Results, 2026-10-12, 21 PRs x 5 runs per variant (qfg-66ko.16). "Same gate"
+means the PR got the same fail/pass outcome on every run. Catch rate is the
+share of runs that BLOCKed a must-block PR (3 throwaways + the seeded key).
+Flag rate is the share of runs that returned WARN or BLOCK on a should-flag PR.
+Noise is the share of runs on clean PRs that returned WARN. Cost uses list
+prices: Haiku 4.5 $1/$5, Haiku 5.5 $0.10/$0.50, Sonnet 5.5 $2/$10, Opus 5.5
+$4/$20, Fable 5.1 $10/$50 per million input/output tokens.
+
+| Variant | Same verdict every run | Same gate every run | Catch rate | Flag rate | False BLOCK (clean) | Noise (WARN on clean) | Latency p50 / p90 | Cost per PR |
+|---|---|---|---|---|---|---|---|---|
+| Haiku 4.5, old free-text verdict (baseline) | 12/21 | 18/21 | 100% | 76% | 5% | 15% | 5.6s / 11.7s | $0.005 |
+| Haiku 4.5, structured, temperature 0 | 21/21 | 21/21 | **75%** | 80% | 0% | 16% | 2.0s / 6.5s | $0.004 |
+| Haiku 5.5, structured, effort low | 17/21 | 20/21 | 100% | 100% | 0% | **88%** | 3.5s / 7.3s | $0.0007 |
+| **Sonnet 5.5, structured, effort medium** | 16/21 | 19/21 | 100% | 100% | 0% | 11% | 3.3s / 8.2s | **$0.012** |
+| Sonnet 5.5, structured, effort low | 17/21 | 20/21 | 100% | 100% | 0% | 30% | 3.3s / 5.7s | $0.011 |
+| Opus 5.5, structured, effort medium | 15/21 | 19/21 | 100% | 100% | 0% | 26% | 5.7s / 12.8s | $0.026 |
+| Fable 5.1, structured, effort low | 17/21 | 19/21 | 100% | 100% | 0% | 25% | 4.5s / 14.7s | $0.063 |
+
+For comparison, the old agent path cost $0.020 to $0.046 per PR (median about
+$0.025, from `total_cost_usd` in 10 recent sanity runs), mostly the agent's own
+system prompt sent on every turn.
+
+What it showed:
+
+- **The structured verdict fixes the flip-flop.** The old free-text contract
+  BLOCKed clean ci#7 on 3 of 5 runs. With the structured verdict no variant
+  BLOCKed a clean PR in 60 runs each. Every "same gate" miss above is a
+  should-flag seeded bug that moved between WARN and BLOCK, where either is
+  acceptable. Must-block and clean PRs got the same gate on every run.
+- **Temperature 0** makes Haiku 4.5 fully repeatable (21/21 identical
+  verdicts, vs 14/21 at temperature 1), but repeatably wrong: it returned WARN
+  on all 10 runs for the hard-coded production SDK key, and PASS on all 5 for
+  the dropped nil-safe call. The 5.x models reject a temperature other than 1,
+  so they rely on the structured verdict.
+- **A confirming second sample is not needed by default.** It only changes
+  anything when the first sample BLOCKs, and the replay set had no false
+  BLOCKs to suppress. It would mainly turn borderline real bugs into WARN.
+  It stays available as `confirm_block: true`.
+- **Haiku 5.5** catches everything at a tenth of a cent, but WARNs on 88% of
+  clean PRs. Some of those WARNs contradict the house floor policy, and a
+  check that always WARNs gets ignored.
+- **Sonnet 5.5 at medium** has the same catch and flag rates as Opus 5.5 and
+  Fable 5.1, with the least noise and the lowest cost of the three. Its
+  findings name the line and the consequence. At low effort it hedges more
+  (30% noise) for the same price.
+
+Decision: **Sonnet 5.5, effort medium.** About $0.004 to $0.026 per PR on this
+set (mean $0.012), roughly half of the old Haiku agent path, and well under the
+$0.02 to $0.10 budget.
 
 ### `secrets`: gitleaks secret scan
 
@@ -326,7 +424,9 @@ For each PR, confirm the justification comment and follow-up bead exist.
 - Callers pin `@main`. A change merged here takes effect on the next PR event
   in every repo. Re-running a job does not pick up a change: it reuses the
   workflow version of the original run. Push a commit, or close and reopen. The composite action is also referenced at `@main`, so prompt
-  changes in a ci PR only take effect after merge.
+  changes in a ci PR only take effect after merge. The reviewer script
+  (`scripts/sanity/`) is checked out at the PR head on quonfig/ci's own PRs,
+  so reviewer changes are tested before merge.
 - `.github/actions/sanity-prompt` exists so the default `prompt.md` ships
   with the workflow: composite actions are downloaded with the whole repo, so
   the caller never has to check out quonfig/ci itself.
