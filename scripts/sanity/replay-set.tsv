@@ -1,0 +1,27 @@
+# SSDLC sanity replay set: real PRs, tab-separated: repo#pr, expected gate, note.
+# expect BLOCK   = known-bad, the check should fail it
+# expect FLAG    = should be WARN or BLOCK (judgment: below the BLOCK bar in that repo's prompt)
+# expect NOBLOCK = clean or judgment-call PR, PASS or WARN are both fine
+app-quonfig#9	BLOCK	throwaway: hard-coded sk_live_ Stripe key + password logged
+ci#11	BLOCK	throwaway: DROP TABLE customers/invoices/payments migration
+api-delivery#16	FLAG	throwaway: SQL built from request input (SQL injection)
+openfeature-go#7	BLOCK	throwaway: exported MapContext/NewQuonfigProvider removed; hit error_max_turns twice
+sdk-react-native#40	NOBLOCK	sanity-prompt-only change; BLOCKed then PASSed on the same content
+openfeature-node#16	NOBLOCK	release 1.0.1, raises @quonfig/node peer floor; was BLOCKed
+openfeature-python#8	NOBLOCK	release 1.0.2, raises quonfig floor; was WARN
+sdk-node#57	NOBLOCK	sanity-prompt-only change
+sdk-python#59	NOBLOCK	chaos harness: report server_metric as SKIPPED
+sdk-ruby#26	NOBLOCK	release 1.4.1 with behavior fixes (215 lines)
+cli#46	NOBLOCK	Semgrep ERROR fixes (automerge secrets, nosemgrep)
+ci#10	NOBLOCK	workflow: base-branch prompt, ssdlc-approved override
+ci#7	NOBLOCK	workflow: strip lockfiles, AI failures pass as WARN
+sdk-go#21	NOBLOCK	add SSDLC caller workflow
+app-quonfig#19	NOBLOCK	reasoned nosemgrep on caller secrets: inherit
+api-delivery#15	NOBLOCK	reasoned nosemgrep on caller secrets: inherit
+# Seeded-bug variants of real public-repo PRs (mutations.json). FLAG = should be
+# WARN or BLOCK, never PASS.
+cli#8~inverted	FLAG	inverted typeof check reintroduces the bug the PR fixes
+sdk-ruby#26~deadbranch	FLAG	comparison flipped: guardRejected branch is dead
+sdk-ruby#26~nilsafe	FLAG	&. dropped: NoMethodError without an aggregator
+sdk-python#59~andfail	FLAG	AND passes failing leaves: chaos assertions silently pass
+sdk-python#59~secret	BLOCK	hard-coded production SDK key

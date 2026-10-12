@@ -22,11 +22,26 @@ on:
         type: number
         default: 3000
       model:
-        description: Claude model for the sanity check.
+        description: >-
+          Claude model for the sanity check. Chosen on the replay set in
+          scripts/sanity (README "Model choice").
         type: string
-        default: claude-haiku-4-5-20251001
+        default: claude-sonnet-5-5
+      effort:
+        description: >-
+          output_config.effort for models that take it (Haiku 5.5, Sonnet 5.5,
+          Opus 5.5, Fable 5.1). Empty = the model's default.
+        type: string
+        default: medium
+      confirm_block:
+        description: >-
+          On a BLOCK, take a second sample (and a third on a split) and fail
+          only on 2 of 3. Off by default: the replay set showed no false BLOCKs
+          on clean PRs once the verdict is structured.
+        type: boolean
+        default: false
       max_turns:
-        description: Max agent turns for the sanity check.
+        description: Deprecated and ignored (the review is a single call, no agent turns). Kept so existing callers do not break.
         type: number
         default: 6
       deps:
@@ -255,96 +270,71 @@ jobs:
             exit 1
           fi
 
-      - name: Checkout PR
+      - name: Fetch the sanity reviewer
         if: steps.go.outputs.review == 'true'
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          repository: quonfig/ci
+          # Every caller uses ssdlc.yml@main, so it gets the reviewer from main.
+          # quonfig/ci's own PRs run their own reviewer, so a change to it is
+          # tested on the PR that makes it.
+          ref: ${{ github.repository == 'quonfig/ci' && github.event.pull_request.head.sha || 'main' }}
+          path: .ssdlc-ci
+          sparse-checkout: scripts/sanity
           persist-credentials: false
 
-      - name: Resolve prompt
+      - name: AI sanity review
         if: steps.go.outputs.review == 'true'
-        id: prompt_file
-        uses: quonfig/ci/.github/actions/sanity-prompt@main
-        with:
-          repo: ${{ github.repository }}
-          base_sha: ${{ github.event.pull_request.base.sha }}
-          token: ${{ github.token }}
-
-      - name: Build prompt and diff
-        if: steps.go.outputs.review == 'true'
-        id: prompt
+        id: review
+        # A crash here is an AI/infrastructure failure, reported as a
+        # non-blocking WARN by the next step (qfg-30x6).
+        continue-on-error: true
         env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PROMPT_FILE: ${{ steps.prompt_file.outputs.path }}
           PROMPT_SOURCE: ${{ steps.prompt_file.outputs.source }}
+          MODEL: ${{ inputs.model }}
+          EFFORT: ${{ inputs.effort }}
+          CONFIRM_BLOCK: ${{ inputs.confirm_block }}
         run: |
-          # Inside the workspace so Claude's Read tool can open it. Copied after
-          # checkout, which would otherwise clean it away.
-          diff_file="$GITHUB_WORKSPACE/.ssdlc-pr.diff"
-          cp "$RUNNER_TEMP/ssdlc/pr.diff" "$diff_file"
-          # Hard byte cap as a second budget guard (huge generated lines).
-          if [ "$(wc -c < "$diff_file")" -gt 200000 ]; then
-            head -c 200000 "$diff_file" > "$diff_file.tmp" && mv "$diff_file.tmp" "$diff_file"
-            printf '\n[diff truncated at 200000 bytes]\n' >> "$diff_file"
-          fi
+          # One Messages API call: the diff goes inline, no tools, no agent
+          # turns, structured verdict. Same code as scripts/sanity/replay.py.
           echo "Prompt source: $PROMPT_SOURCE ($PROMPT_FILE)"
-          {
-            echo 'prompt<<SSDLC_PROMPT_EOF'
-            cat "$PROMPT_FILE"
-            echo
-            echo "---"
-            echo "Repository: $REPO, pull request #$PR."
-            echo "The full unified diff is at: $diff_file"
-            if [ -s "$RUNNER_TEMP/ssdlc/skipped.txt" ]; then
-              echo "Lockfiles and generated files were removed from that diff (dependency changes are scanned by a separate job):"
-              head -n 50 "$RUNNER_TEMP/ssdlc/skipped.txt" | sed 's/^/- /'
-            fi
-            echo "Read that file first. You may open other files in the checked-out repo for context, but stay brief."
-            echo "Do not post comments or edit files. Write your review as your final answer in GitHub markdown,"
-            echo "and make the very last line exactly one of: VERDICT: PASS, VERDICT: WARN, VERDICT: BLOCK"
-            echo 'SSDLC_PROMPT_EOF'
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Claude sanity check
-        if: steps.go.outputs.review == 'true'
-        id: claude
-        # An AI/infrastructure failure (error_max_turns, API outage, ...) must
-        # not fail the gate: the next step turns it into a WARN (qfg-30x6).
-        continue-on-error: true
-        uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github_token: ${{ github.token }}
-          prompt: ${{ steps.prompt.outputs.prompt }}
-          claude_args: >-
-            --model ${{ inputs.model }}
-            --max-turns ${{ inputs.max_turns }}
-            --allowedTools Read,Grep,Glob
+          confirm=""
+          if [ "$CONFIRM_BLOCK" = "true" ]; then confirm="--confirm-block"; fi
+          python3 .ssdlc-ci/scripts/sanity/sanity_review.py \
+            --prompt "$PROMPT_FILE" \
+            --diff "$RUNNER_TEMP/ssdlc/pr.diff" \
+            --skipped "$RUNNER_TEMP/ssdlc/skipped.txt" \
+            --repo "$REPO" --pr "$PR" \
+            --model "$MODEL" --effort "$EFFORT" $confirm \
+            --out "$RUNNER_TEMP/ssdlc/result.json"
 
       - name: Post findings and apply verdict
         if: steps.go.outputs.review == 'true'
         env:
-          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+          RESULT: ${{ runner.temp }}/ssdlc/result.json
           PROMPT_SOURCE: ${{ steps.prompt_file.outputs.source }}
-          CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
           MODEL: ${{ inputs.model }}
+          EFFORT: ${{ inputs.effort }}
         run: |
+          verdict=""
+          status=""
           review=""
-          subtype=""
-          if [ -n "$EXECUTION_FILE" ] && [ -s "$EXECUTION_FILE" ]; then
-            review=$(jq -r '[.[] | select(.type == "result")] | last | .result // ""' "$EXECUTION_FILE" 2>/dev/null || true)
-            subtype=$(jq -r '[.[] | select(.type == "result")] | last | .subtype // ""' "$EXECUTION_FILE" 2>/dev/null || true)
-          fi
-          verdict=$(printf '%s\n' "$review" | grep -oE 'VERDICT: (PASS|WARN|BLOCK)' | tail -n1 | awk '{print $2}' || true)
           incomplete=""
-          if [ "$verdict" != "BLOCK" ] && [ "$CLAUDE_OUTCOME" != "success" ]; then
-            # Only an explicit BLOCK fails. A run that did not finish
-            # (error_max_turns, API error, ...) is an AI infrastructure
-            # problem, reported as a non-blocking WARN (qfg-30x6).
-            incomplete="${subtype:-claude-code-action $CLAUDE_OUTCOME}"
+          if [ -s "$RESULT" ]; then
+            verdict=$(jq -r '.verdict // ""' "$RESULT")
+            status=$(jq -r '.status // ""' "$RESULT")
+            review=$(jq -r '.review // ""' "$RESULT")
+          fi
+          if [ "$status" != "ok" ]; then
+            # Only an explicit BLOCK fails. A review that did not finish (API
+            # error, refusal, unparseable output, crash) is an AI
+            # infrastructure problem, reported as a non-blocking WARN (qfg-30x6).
+            incomplete=$(jq -r '.error // empty' "$RESULT" 2>/dev/null || true)
+            incomplete=${incomplete:-sanity_review.py did not produce a result}
             verdict=WARN
           fi
-          verdict=${verdict:-UNKNOWN}
           marker='<!-- ssdlc-sanity -->'
           body_file="$RUNNER_TEMP/ssdlc/comment.md"
           {
@@ -352,14 +342,12 @@ jobs:
             echo "### SSDLC sanity check: \`$verdict\`"
             echo
             if [ -n "$incomplete" ]; then
-              echo "_The AI sanity check did not complete (\`$incomplete\`). This is an AI infrastructure issue, not a finding, so the check passes. Re-run the job for a review._"
-            elif [ -n "$review" ]; then
-              printf '%s\n' "$review"
+              echo "_The AI sanity check did not complete (\`${incomplete:0:300}\`). This is an AI infrastructure issue, not a finding, so the check passes. Re-run the job for a review._"
             else
-              echo "_The model returned no review text._"
+              printf '%s\n' "$review"
             fi
             echo
-            echo "<sub>Model: $MODEL, commit ${HEAD_SHA:0:7}, prompt $PROMPT_SOURCE. Only BLOCK fails this check. To override a BLOCK after reading it, a human adds \`ssdlc-approved\` (sanity check only, this commit only) or, in an emergency, \`hotfix\` (all checks, needs a justification and follow-up bead).</sub>"
+            echo "<sub>Model: $MODEL${EFFORT:+ (effort $EFFORT)}, commit ${HEAD_SHA:0:7}, prompt $PROMPT_SOURCE. Only BLOCK fails this check. To override a BLOCK after reading it, a human adds \`ssdlc-approved\` (sanity check only, this commit only) or, in an emergency, \`hotfix\` (all checks, needs a justification and follow-up bead).</sub>"
           } > "$body_file"
           # One sticky comment per PR: update in place instead of piling up.
           comment_id=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
@@ -374,8 +362,6 @@ jobs:
             BLOCK)
               echo "::error title=SSDLC sanity::BLOCK verdict - see the PR comment. Fix it, or a human adds the 'ssdlc-approved' label (sanity only) or 'hotfix' (emergency) to override."
               exit 1 ;;
-            UNKNOWN)
-              echo "::warning title=SSDLC sanity::no verdict line found in the model output; passing" ;;
             *)
               if [ -n "$incomplete" ]; then
                 echo "::warning title=SSDLC sanity::AI sanity check did not complete ($incomplete); non-blocking WARN, check passes. Re-run the job for a review."
