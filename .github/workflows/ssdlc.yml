@@ -283,6 +283,15 @@ jobs:
           sparse-checkout: scripts/sanity
           persist-credentials: false
 
+      - name: Resolve prompt
+        if: steps.go.outputs.review == 'true'
+        id: prompt_file
+        uses: quonfig/ci/.github/actions/sanity-prompt@main
+        with:
+          repo: ${{ github.repository }}
+          base_sha: ${{ github.event.pull_request.base.sha }}
+          token: ${{ github.token }}
+
       - name: AI sanity review
         if: steps.go.outputs.review == 'true'
         id: review
