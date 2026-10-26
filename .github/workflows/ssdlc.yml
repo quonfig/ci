@@ -272,7 +272,7 @@ jobs:
 
       - name: Fetch the sanity reviewer
         if: steps.go.outputs.review == 'true'
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: quonfig/ci
           # Every caller uses ssdlc.yml@main, so it gets the reviewer from main.
@@ -401,7 +401,7 @@ jobs:
       HAS_HOTFIX: ${{ contains(github.event.pull_request.labels.*.name, 'hotfix') }}
     steps:
       - name: Checkout PR head (full history)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
@@ -506,7 +506,7 @@ jobs:
       HEAD_SHA: ${{ github.event.pull_request.head.sha }}
     steps:
       - name: Checkout PR head (full history, for the merge base)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
@@ -554,7 +554,7 @@ jobs:
       HAS_HOTFIX: ${{ contains(github.event.pull_request.labels.*.name, 'hotfix') }}
     steps:
       - name: Checkout PR head (full history, for the merge base)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
