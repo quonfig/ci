@@ -1,0 +1,21 @@
+# Dependabot version updates for the actions this repo runs (bead qfg-66ko.15).
+# Third-party actions are pinned to full commit SHAs with a version comment;
+# Dependabot bumps the SHA and the comment together.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directories:
+      - "/"
+      - "/.github/actions/*"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+    labels:
+      - dependencies
+    ignore:
+      # This repo's own actions/workflows, referenced at @main on purpose.
+      - dependency-name: "quonfig/ci*"
+    groups:
+      actions-minor-patch:
+        update-types: [minor, patch]
