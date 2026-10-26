@@ -320,17 +320,16 @@ reason = "Not reachable: we never parse untrusted YAML. Upgrade tracked in qfg-x
 #### Enforcement rollout
 
 Inputs: `deps` (default `true`) runs the job; `deps_enforce` (default
-**`false`** for now) makes findings fail the check. Report-only mode posts the
-same annotations and summary but the check passes.
+`true`) makes findings fail the check. Report-only mode (`deps_enforce: false`)
+posts the same annotations and summary but the check passes.
 
-All in-scope repos, SDKs included, run the scan (`deps: true`). The SDK
-findings are real (mostly stale transitive JS packages and test tooling, fixed
-by a lockfile refresh), not false-positive noise, and an SDK ships to
-customers, so it gets the same control. Enforcement is off by default only
-because every JS repo already has HIGH/CRITICAL findings; once that backlog is
-fixed (bead `qfg-66ko.3` follow-up), flip the `deps_enforce` default to `true`
-here and every repo is gated at once. A repo that wants enforcement earlier
-sets `deps_enforce: true` in its caller.
+All in-scope repos, SDKs included, run the scan and are enforced. An SDK ships
+to customers, so it gets the same control as a service. The default was
+`false` during rollout while every JS repo carried a HIGH/CRITICAL backlog; it
+flipped to `true` once that backlog was cleared (`qfg-66ko.3`) and the check
+became diff-aware, so findings already on the base branch only warn. A repo
+that needs to opt out sets `deps_enforce: false` in its caller, with the
+reason in the PR.
 
 To run the check locally before pushing (any OS; needs Python 3.11+):
 
