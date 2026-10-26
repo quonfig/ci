@@ -247,6 +247,20 @@ ignored **and that the PR introduces**.
 - Fail closed: if the merge base cannot be found, checked out or scanned, every
   finding is enforced, as before.
 
+**Pre-existing findings are tracked by Dependabot, not by this job.** Because
+`deps` only fails on what a PR introduces, the control for advisories already
+on the default branch is GitHub Dependabot alerts, which are enabled on every
+in-scope repo and continuously check the default branch's dependency graph
+against the GitHub Advisory Database. Each alert records when it was opened
+and when it was fixed or dismissed, which is the evidence for the remediation
+deadlines in the vulnerability policy (Critical 14 days, High 30 days, measured
+from the alert's `created_at`). Dependabot security updates open the fix PR
+where one exists. An alert with no in-range fix stays open until someone
+upgrades or adds an `osv-scanner.toml` ignore, so open HIGH/CRITICAL alerts
+need a periodic look. This only works for lockfiles that appear in the repo's
+dependency graph (Insights > Dependency graph); a lockfile missing there is
+not alerted on.
+
 - Engine: [osv-scanner](https://github.com/google/osv-scanner) v2 for every
   ecosystem, pinned and SHA-256 verified (`OSV_VERSION` / `OSV_SHA256` in
   [`.github/actions/deps-scan/action.yml`](.github/actions/deps-scan/action.yml)).
