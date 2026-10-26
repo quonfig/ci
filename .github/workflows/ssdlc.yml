@@ -272,7 +272,7 @@ jobs:
 
       - name: Fetch the sanity reviewer
         if: steps.go.outputs.review == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: quonfig/ci
           # Every caller uses ssdlc.yml@main, so it gets the reviewer from main.
@@ -401,7 +401,7 @@ jobs:
       HAS_HOTFIX: ${{ contains(github.event.pull_request.labels.*.name, 'hotfix') }}
     steps:
       - name: Checkout PR head (full history)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
@@ -506,7 +506,7 @@ jobs:
       HEAD_SHA: ${{ github.event.pull_request.head.sha }}
     steps:
       - name: Checkout PR head (full history, for the merge base)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
@@ -554,14 +554,14 @@ jobs:
       HAS_HOTFIX: ${{ contains(github.event.pull_request.labels.*.name, 'hotfix') }}
     steps:
       - name: Checkout PR head (full history, for the merge base)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
 
