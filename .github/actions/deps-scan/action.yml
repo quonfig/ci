@@ -3,7 +3,9 @@ description: >
   Scans every lockfile/manifest in the checked-out repo with osv-scanner
   (pinned, checksum-verified) and applies the Quonfig HIGH/CRITICAL policy via
   deps_scan.py. Go modules get osv-scanner's call analysis (the govulncheck
-  engine), so unreachable Go vulns are reported but do not fail.
+  engine), so unreachable Go vulns are reported but do not fail. With
+  base-sha, the scan is diff-aware: findings already present at that commit
+  are reported but do not fail.
 inputs:
   hotfix:
     description: "'true' when the PR carries the hotfix label (findings become warnings)"
@@ -11,6 +13,11 @@ inputs:
   enforce:
     description: "'false' = report-only (findings become warnings)"
     default: "true"
+  base-sha:
+    description: >-
+      Commit to compare against (the PR's merge base). Needs full history in
+      the checkout. Empty = no baseline, every finding is enforced.
+    default: ""
 runs:
   using: composite
   steps:
@@ -55,9 +62,21 @@ runs:
       env:
         HOTFIX: ${{ inputs.hotfix }}
         ENFORCE: ${{ inputs.enforce }}
+        BASE_SHA: ${{ inputs.base-sha }}
       run: |
         set -uo pipefail
         args=(--osv-bin "$OSV_BIN" --repo "$GITHUB_WORKSPACE")
+        if [ -n "$BASE_SHA" ]; then
+          # Outside the workspace, so the head scan does not pick it up.
+          base_dir="$RUNNER_TEMP/ssdlc-deps-base"
+          if git -C "$GITHUB_WORKSPACE" worktree add --detach "$base_dir" "$BASE_SHA"; then
+            echo "Baseline: ${BASE_SHA:0:7} at $base_dir"
+            args+=(--base-repo "$base_dir")
+          else
+            # Fail closed: without a baseline every finding is enforced.
+            echo "::warning title=SSDLC deps::could not check out baseline ${BASE_SHA:0:7}; enforcing every finding"
+          fi
+        fi
         [ "$HOTFIX" = "true" ] && args+=(--hotfix)
         [ "$ENFORCE" = "true" ] || args+=(--report-only)
         python3 "$GITHUB_ACTION_PATH/deps_scan.py" "${args[@]}"

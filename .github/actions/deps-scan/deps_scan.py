@@ -13,12 +13,19 @@ Quonfig policy on top of its JSON output:
   * per-repo ignores live in osv-scanner.toml at the repo root as
     [[IgnoredVulns]] entries; every entry MUST carry a non-empty `reason`, and
     an entry past its `ignoreUntil` stops applying;
+  * diff-aware with --base-repo (the PR's merge base): a finding already on
+    the base branch (same ecosystem, package, lockfile and advisory) is
+    reported as a warning, not failed, so a newly published advisory against
+    code on main does not block every unrelated PR. Only findings the PR
+    introduces fail. If the baseline cannot be scanned, every finding is
+    enforced (fail closed);
   * --hotfix (the PR's `hotfix` label) and --report-only (the caller's
     deps_enforce: false) downgrade every failure to a warning.
 
 Needs Python 3.11+ (tomllib). Usage:
   deps_scan.py --osv-bin PATH [--repo DIR] [--hotfix] [--report-only]
   deps_scan.py --osv-json FILE [--repo DIR] ...   # evaluate a saved scan
+  ... --base-repo DIR [--base-osv-json FILE]      # diff-aware against a baseline
 Exit status: 0 pass, 1 policy failure, 2 tool/config error.
 """
 
@@ -162,11 +169,98 @@ def manifest_dirs(repo: Path) -> dict[Path, list[str]]:
     return found
 
 
+def collect(results: list, repo: Path, ignores: dict[str, dict]) -> tuple[list, list, list]:
+    """Apply the policy to osv-scanner results: (blocking, reported, ignored)."""
+    blocking, reported, ignored_hits = [], [], []
+    for res in results:
+        src = Path(res["source"]["path"])
+        rel_src = str(src.relative_to(repo)) if src.is_relative_to(repo) else str(src)
+        for pkg in res.get("packages") or []:
+            groups = pkg.get("groups") or []
+            if not groups:
+                continue
+            vulns_by_id = {v["id"]: v for v in pkg.get("vulnerabilities") or []}
+            p = pkg["package"]
+            for g in groups:
+                ids = set(g.get("ids", [])) | set(g.get("aliases", []))
+                analysis = g.get("experimental_analysis") or {}
+                if analysis and all(a.get("unimportant") for a in analysis.values()):
+                    continue
+                score, label = severity(g, vulns_by_id)
+                # Either signal is enough: CVSS >= 7.0, or GitHub rates it HIGH/CRITICAL.
+                high = (score is not None and score >= HIGH_SCORE) or label in BLOCKING_LABELS
+                if not high:
+                    continue
+                # Prefer a GHSA id; fall back to any alias if a group has no ids.
+                primary = sorted(g.get("ids") or ids or ["UNKNOWN"], key=lambda x: (not x.startswith("GHSA"), x))[0]
+                row = {
+                    "id": primary,
+                    "ids": sorted(ids),
+                    "pkg": f"{p['name']}@{p.get('version', '?')}",
+                    "name": p["name"],
+                    "eco": p.get("ecosystem", "?"),
+                    "sev": f"{score if score is not None else '-'} {label}".strip(),
+                    "fixed": fixed_versions(g, vulns_by_id),
+                    "file": rel_src,
+                    "why": "",
+                }
+                hit = next((ignores[i] for i in sorted(ids) if i in ignores), None)
+                if hit:
+                    row["why"] = f"ignored: {hit['reason']} (until {hit['until']})"
+                    ignored_hits.append(row)
+                    continue
+                if analysis and all(a.get("called") is False for a in analysis.values()):
+                    row["why"] = "not called (Go call analysis)"
+                    reported.append(row)
+                else:
+                    blocking.append(row)
+    return blocking, reported, ignored_hits
+
+
+def finding_keys(r: dict) -> set[tuple[str, str, str, str]]:
+    """(ecosystem, package name, lockfile, advisory id) for every id/alias.
+
+    The version is left out on purpose: bumping a package to another version
+    that is still affected by the same advisory does not introduce anything.
+    """
+    return {(r["eco"], r["name"], r["file"], i) for i in r["ids"]}
+
+
+def baseline_keys(args: argparse.Namespace, ignores: dict[str, dict]) -> set | None:
+    """Keys of the HIGH/CRITICAL findings on the base branch, or None on failure."""
+    base = Path(args.base_repo).resolve()
+    try:
+        if args.base_osv_json:
+            path = Path(args.base_osv_json)
+        else:
+            tmp = Path(tempfile.mkdtemp(prefix="ssdlc-deps-base-"))
+            path = tmp / "osv.json"
+            rc = run_osv(args.osv_bin, base, path)
+            if rc == 128:
+                return set()  # base has no package sources
+            if rc not in (0, 1):
+                return None
+        results = json.loads(path.read_text()).get("results") or []
+    except (OSError, ValueError) as e:
+        print(f"baseline scan error: {e}")
+        return None
+    # The PR head's ignores are applied to the base too; an ignored finding is
+    # not blocking either way. Only base findings that would block count: a Go
+    # vuln that was "not called" on the base and is called at the head is new.
+    blocking, _, _ = collect(results, base, ignores)
+    keys: set = set()
+    for r in blocking:
+        keys |= finding_keys(r)
+    return keys
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default=".")
     ap.add_argument("--osv-bin")
     ap.add_argument("--osv-json")
+    ap.add_argument("--base-repo", help="checkout of the PR's merge base; enables diff-aware mode")
+    ap.add_argument("--base-osv-json", help="saved osv-scanner JSON for --base-repo")
     ap.add_argument("--hotfix", action="store_true")
     ap.add_argument("--report-only", action="store_true")
     ap.add_argument("--summary", default=os.environ.get("GITHUB_STEP_SUMMARY"))
@@ -230,48 +324,23 @@ def main() -> int:
             f,
         )
 
-    blocking, reported, ignored_hits = [], [], []
-    for res in results:
-        src = Path(res["source"]["path"])
-        rel_src = str(src.relative_to(repo)) if src.is_relative_to(repo) else str(src)
-        for pkg in res.get("packages") or []:
-            groups = pkg.get("groups") or []
-            if not groups:
-                continue
-            vulns_by_id = {v["id"]: v for v in pkg.get("vulnerabilities") or []}
-            p = pkg["package"]
-            for g in groups:
-                ids = set(g.get("ids", [])) | set(g.get("aliases", []))
-                analysis = g.get("experimental_analysis") or {}
-                if analysis and all(a.get("unimportant") for a in analysis.values()):
-                    continue
-                score, label = severity(g, vulns_by_id)
-                # Either signal is enough: CVSS >= 7.0, or GitHub rates it HIGH/CRITICAL.
-                high = (score is not None and score >= HIGH_SCORE) or label in BLOCKING_LABELS
-                if not high:
-                    continue
-                # Prefer a GHSA id; fall back to any alias if a group has no ids.
-                primary = sorted(g.get("ids") or ids or ["UNKNOWN"], key=lambda x: (not x.startswith("GHSA"), x))[0]
-                row = {
-                    "id": primary,
-                    "ids": sorted(ids),
-                    "pkg": f"{p['name']}@{p.get('version', '?')}",
-                    "eco": p.get("ecosystem", "?"),
-                    "sev": f"{score if score is not None else '-'} {label}".strip(),
-                    "fixed": fixed_versions(g, vulns_by_id),
-                    "file": rel_src,
-                    "why": "",
-                }
-                hit = next((ignores[i] for i in sorted(ids) if i in ignores), None)
-                if hit:
-                    row["why"] = f"ignored: {hit['reason']} (until {hit['until']})"
-                    ignored_hits.append(row)
-                    continue
-                if analysis and all(a.get("called") is False for a in analysis.values()):
-                    row["why"] = "not called (Go call analysis)"
-                    reported.append(row)
+    blocking, reported, ignored_hits = collect(results, repo, ignores)
+
+    # Diff-aware: drop findings that already exist on the base branch.
+    pre_existing = []
+    if args.base_repo:
+        base_keys = baseline_keys(args, ignores)
+        if base_keys is None:
+            GH.emit("warning", "baseline scan of the base branch failed; enforcing every finding (fail closed)")
+        else:
+            still = []
+            for r in blocking:
+                if any(k in base_keys for k in finding_keys(r)):
+                    r["why"] = "already on the base branch"
+                    pre_existing.append(r)
                 else:
-                    blocking.append(row)
+                    still.append(r)
+            blocking = still
 
     def line(r: dict) -> str:
         return f"{r['pkg']} ({r['eco']}): {r['id']} severity {r['sev']}, fixed in {r['fixed']}"
@@ -280,7 +349,7 @@ def main() -> int:
     status = "hotfix" if args.hotfix else ("would block" if args.report_only else "BLOCK")
     for r in blocking:
         GH.emit("warning" if soft else "error", line(r), r["file"])
-    for r in reported:
+    for r in reported + pre_existing:
         GH.emit("warning", f"{line(r)} [not enforced: {r['why']}]", r["file"])
     for r in ignored_hits:
         GH.emit("notice", f"{line(r)} [{r['why']}]", r["file"])
@@ -291,9 +360,17 @@ def main() -> int:
             if args.report_only:
                 fh.write("Report-only mode (`deps_enforce: false`): findings do not fail the check.\n\n")
             fh.write(f"Sources scanned: {len([s for s in sources if s[1]])}. ")
-            fh.write(f"Blocking: {len(blocking)}. Reported only: {len(reported)}. Ignored: {len(ignored_hits)}.\n\n")
+            fh.write(
+                f"Blocking: {len(blocking)}. Pre-existing on the base branch: {len(pre_existing)}. "
+                f"Reported only: {len(reported)}. Ignored: {len(ignored_hits)}.\n\n"
+            )
+            if pre_existing:
+                fh.write(
+                    "Pre-existing findings are already on the base branch, so they do not fail this PR. "
+                    "Fix them in their own PR.\n\n"
+                )
             rows = [(r, status) for r in blocking]
-            rows += [(r, r["why"]) for r in reported + ignored_hits]
+            rows += [(r, r["why"]) for r in pre_existing + reported + ignored_hits]
             if rows:
                 fh.write("| Status | Package | Advisory | Severity | Fixed in | File |\n|---|---|---|---|---|---|\n")
                 for r, st in rows:
@@ -302,7 +379,7 @@ def main() -> int:
                 fh.write("\nNot scanned (no supported lockfile): " + ", ".join(f"`{u}`" for u in unscanned) + "\n")
 
     print(
-        f"\nSummary: {len(blocking)} blocking, {len(reported)} reported-only, "
+        f"\nSummary: {len(blocking)} blocking, {len(pre_existing)} pre-existing, {len(reported)} reported-only, "
         f"{len(ignored_hits)} ignored, {len(unscanned)} unscanned manifest(s)."
     )
     if not blocking:

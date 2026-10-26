@@ -230,9 +230,22 @@ so this job is the control there.
 
 ### `deps`: dependency vulnerability scan
 
-Scans every lockfile and manifest in the repo at the PR head (the whole
-dependency tree, not just the diff, so a newly published advisory shows up on
-the next PR) and fails only on **HIGH/CRITICAL** findings that are not ignored.
+Scans every lockfile and manifest in the repo at the PR head, and again at
+the PR's merge base. It fails only on **HIGH/CRITICAL** findings that are not
+ignored **and that the PR introduces**.
+
+- **Diff-aware.** A finding already on the base branch (same ecosystem,
+  package, lockfile and advisory id) is reported as a warning and listed as
+  "already on the base branch" in the summary, but it does not fail the PR.
+  So a newly published advisory against a dependency on `main` does not block
+  every unrelated PR in that repo. It is fixed in its own PR (a bump or an
+  `osv-scanner.toml` ignore). The version is not part of the match, so bumping
+  to another still-affected version is not a new finding.
+- A PR fails when it adds a vulnerable package, adds a new advisory to an
+  existing package, adds the vulnerable package to another lockfile, or makes
+  a Go vuln reachable that was "not called" on the base.
+- Fail closed: if the merge base cannot be found, checked out or scanned, every
+  finding is enforced, as before.
 
 - Engine: [osv-scanner](https://github.com/google/osv-scanner) v2 for every
   ecosystem, pinned and SHA-256 verified (`OSV_VERSION` / `OSV_SHA256` in
@@ -310,7 +323,12 @@ To run the check locally before pushing (any OS; needs Python 3.11+):
 ```bash
 # download osv-scanner_<os>_<arch> from the pinned release, then from the repo root:
 python3 path/to/ci/.github/actions/deps-scan/deps_scan.py --osv-bin ./osv-scanner --repo .
+# diff-aware, like CI: add a checkout of the merge base
+git worktree add --detach /tmp/deps-base "$(git merge-base origin/main HEAD)"
+python3 path/to/ci/.github/actions/deps-scan/deps_scan.py --osv-bin ./osv-scanner --repo . --base-repo /tmp/deps-base
 ```
+
+The policy script's tests: `python3 -m unittest discover -s .github/actions/deps-scan`.
 
 Run it on a clean clone: osv-scanner skips git-ignored paths, and a sub-repo
 nested inside the gitignored monorepo checkout looks ignored to it.

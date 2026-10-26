@@ -501,21 +501,36 @@ jobs:
       cancel-in-progress: true
     permissions:
       contents: read
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
     steps:
-      - name: Checkout PR head
+      - name: Checkout PR head (full history, for the merge base)
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-          fetch-depth: 1
+          fetch-depth: 0
           persist-credentials: false
 
-      # Scans the whole dependency tree at the PR head (not just the diff):
-      # a newly published advisory shows up on the next PR in that repo.
+      - name: Find the merge base
+        id: base
+        run: |
+          if mb=$(git merge-base "$BASE_SHA" "$HEAD_SHA"); then
+            echo "Merge base: $mb (base ${BASE_SHA:0:7}, head ${HEAD_SHA:0:7})"
+            echo "sha=$mb" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning title=SSDLC deps::no merge base found; enforcing every finding"
+          fi
+
+      # Scans the whole dependency tree at the PR head, and again at the merge
+      # base. Only findings the PR introduces fail; findings already on the
+      # base branch (e.g. a newly published advisory) are reported, not failed.
       - name: Dependency vulnerability scan
         uses: quonfig/ci/.github/actions/deps-scan@main
         with:
           hotfix: ${{ contains(github.event.pull_request.labels.*.name, 'hotfix') }}
           enforce: ${{ inputs.deps_enforce }}
+          base-sha: ${{ steps.base.outputs.sha }}
 
   sast:
     name: sast
