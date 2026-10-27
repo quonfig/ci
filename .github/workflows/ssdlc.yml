@@ -50,11 +50,11 @@ on:
         default: true
       deps_enforce:
         description: >-
-          Fail the deps check on unignored HIGH/CRITICAL findings. false =
-          report-only (annotations + job summary, check passes). Rollout
-          default is false until the existing backlog is fixed (qfg-66ko.3).
+          Fail the deps check on unignored HIGH/CRITICAL findings the PR
+          introduces. false = report-only (annotations + job summary, check
+          passes).
         type: boolean
-        default: false
+        default: true
       sast:
         description: Run the Semgrep static analysis (sast job).
         type: boolean
