@@ -409,11 +409,22 @@ It never blocks work:
   GitHub Code Security, so the job skips itself there.
 
 A repo opts in by copying [`templates/code-scanning.yml`](templates/code-scanning.yml)
-to `.github/workflows/code-scanning.yml`. The caller has to grant
-`security-events: write`, because a called workflow can only use permissions
-its caller grants. That is why this is a separate caller, and not a job inside
-`ssdlc.yml`: none of the existing `ssdlc.yml` callers grant it. This repo uses
-[`code-scanning-main.yml`](.github/workflows/code-scanning-main.yml).
+to `.github/workflows/code-scanning.yml`. The caller has two jobs:
+
+- `scan` calls this repo's workflow with `upload: false`. The Semgrep logic
+  stays here, and the SARIF comes back as the `semgrep-sarif` artifact.
+- `upload` downloads that artifact and runs `github/codeql-action/upload-sarif`
+  in the repo itself. It lives in the repo because Comp's Code Scanning check
+  reads the repo's own workflow files for an upload step and does not follow
+  `uses:` into quonfig/ci.
+
+The caller grants `security-events: write`, because a called workflow can only
+use permissions its caller grants. That is also why this is a separate caller
+and not a job inside `ssdlc.yml`: none of the existing `ssdlc.yml` callers
+grant it. This repo uses
+[`code-scanning-main.yml`](.github/workflows/code-scanning-main.yml). The
+`upload` input defaults to `true` for older callers that only `uses:` this
+workflow.
 
 Suppressions work as they do for `sast`: `.semgrepignore` paths are skipped,
 and a finding with an inline `nosemgrep` reason is dropped before upload
