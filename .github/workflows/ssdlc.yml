@@ -286,7 +286,7 @@ jobs:
       - name: Resolve prompt
         if: steps.go.outputs.review == 'true'
         id: prompt_file
-        uses: quonfig/ci/.github/actions/sanity-prompt@main
+        uses: quonfig/ci/.github/actions/sanity-prompt@main # nosemgrep: yaml.github-actions.security.github-actions-mutable-action-tag.github-actions-mutable-action-tag -- first-party action in this repo, @main on purpose so every caller gets gate fixes at once (README "Notes"); main is ruleset-protected
         with:
           repo: ${{ github.repository }}
           base_sha: ${{ github.event.pull_request.base.sha }}
@@ -526,7 +526,7 @@ jobs:
       # base. Only findings the PR introduces fail; findings already on the
       # base branch (e.g. a newly published advisory) are reported, not failed.
       - name: Dependency vulnerability scan
-        uses: quonfig/ci/.github/actions/deps-scan@main
+        uses: quonfig/ci/.github/actions/deps-scan@main # nosemgrep: yaml.github-actions.security.github-actions-mutable-action-tag.github-actions-mutable-action-tag -- first-party action in this repo, @main on purpose so every caller gets gate fixes at once (README "Notes"); main is ruleset-protected
         with:
           hotfix: ${{ contains(github.event.pull_request.labels.*.name, 'hotfix') }}
           enforce: ${{ inputs.deps_enforce }}
