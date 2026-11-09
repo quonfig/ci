@@ -389,6 +389,35 @@ semgrep scan --config p/ci --metrics=off --baseline-commit "$(git merge-base ori
 semgrep scan --config p/ci --metrics=off --severity ERROR   # full scan
 ```
 
+## Code scanning upload (report-only)
+
+[`.github/workflows/code-scanning.yml`](.github/workflows/code-scanning.yml)
+runs a **full** Semgrep scan of `main` (same version and `p/ci` ruleset as
+`sast`) and uploads it as SARIF to GitHub code scanning, so findings show in
+each repo's Security tab. This is SOC 2 evidence for the Comp "Code Scanning"
+check; the merge gate is still the diff-aware `sast` job above.
+
+It never blocks work:
+
+- It runs on push to `main`, weekly, and on manual dispatch, never on
+  `pull_request`, so it attaches no check to a PR.
+- It is **not** a required check in `main-ssdlc`. Do not make it one, and
+  leave the ruleset's "require code scanning results" rule off. Findings
+  already on `main` (a new rule, a newly published pattern) become alerts to
+  triage, not a freeze.
+- It runs on public repos only. SARIF upload on a private repo needs paid
+  GitHub Code Security, so the job skips itself there.
+
+A repo opts in by copying [`templates/code-scanning.yml`](templates/code-scanning.yml)
+to `.github/workflows/code-scanning.yml`. The caller has to grant
+`security-events: write`, because a called workflow can only use permissions
+its caller grants. That is why this is a separate caller, and not a job inside
+`ssdlc.yml`: none of the existing `ssdlc.yml` callers grant it. This repo uses
+[`code-scanning-main.yml`](.github/workflows/code-scanning-main.yml).
+
+Suppressions work as they do for `sast`: an inline `nosemgrep` is uploaded as
+a suppressed result, and `.semgrepignore` paths are skipped.
+
 ## Overrides
 
 Two labels override a failing check. Only a human applies either one, after

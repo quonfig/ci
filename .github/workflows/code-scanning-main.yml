@@ -1,0 +1,21 @@
+# quonfig/ci's own caller for code-scanning.yml. Other repos copy
+# templates/code-scanning.yml, which is the same file with
+#   uses: quonfig/ci/.github/workflows/code-scanning.yml@main
+# REPORT-ONLY: runs after merge, never on a PR, and is not a required check.
+name: code-scanning
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  code-scanning:
+    uses: ./.github/workflows/code-scanning.yml
