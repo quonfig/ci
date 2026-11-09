@@ -1,0 +1,87 @@
+# Code scanning: full Semgrep scan of the default branch, uploaded as SARIF to
+# GitHub code scanning (the repo's Security tab).
+#
+# REPORT-ONLY. This never blocks a merge:
+#   - it runs on push to main and on a schedule, never on pull_request, so it
+#     attaches no check to any PR;
+#   - it is not a required check in the main-ssdlc ruleset, and must not be
+#     made one;
+#   - the ruleset's "require code scanning results" rule stays off.
+# Findings already on main show up as Security-tab alerts to triage; they do
+# not freeze main. The merge gate is still the diff-aware `ssdlc / sast` job
+# in ssdlc.yml, which only fails on findings a PR introduces.
+#
+# Public repos only. SARIF upload on a private repo needs paid GitHub Code
+# Security, so the job is skipped there.
+#
+# Callers copy templates/code-scanning.yml, which grants the
+# `security-events: write` this job needs (a called workflow can only use
+# permissions its caller grants).
+name: code-scanning
+
+on:
+  workflow_call: {}
+
+jobs:
+  semgrep:
+    name: semgrep
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.event.repository.private == false
+    concurrency:
+      group: code-scanning-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    env:
+      # Keep in step with SEMGREP_VERSION / SEMGREP_CONFIG in ssdlc.yml.
+      SEMGREP_VERSION: 1.179.0
+      SEMGREP_CONFIG: p/ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Semgrep CE (pinned)
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/semgrep-venv"
+          "$RUNNER_TEMP/semgrep-venv/bin/pip" install --quiet --disable-pip-version-check "semgrep==${SEMGREP_VERSION}"
+          "$RUNNER_TEMP/semgrep-venv/bin/semgrep" --version
+          echo "$RUNNER_TEMP/semgrep-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Full scan to SARIF
+        env:
+          SEMGREP_SEND_METRICS: "off"
+        run: |
+          set -uo pipefail
+          # Full scan (no baseline): code scanning tracks every open finding on
+          # the default branch. Honors the repo's .semgrepignore and inline
+          # nosemgrep comments, like the PR gate.
+          out="$RUNNER_TEMP/semgrep.sarif"
+          rc=0
+          semgrep scan --config "$SEMGREP_CONFIG" --metrics=off --disable-version-check \
+            --sarif --output "$out" --quiet || rc=$?
+          # Without --error semgrep exits 0 even with findings: non-zero means
+          # the tool itself failed. Fail this (non-required) job so it is seen.
+          if [ "$rc" -ne 0 ] || [ ! -s "$out" ]; then
+            echo "::error title=code-scanning::semgrep failed to run (exit $rc)"
+            exit 2
+          fi
+          results=$(jq '[.runs[].results[]] | length' "$out")
+          echo "::notice title=code-scanning::$results finding(s) in the full scan, uploading to code scanning"
+          echo "sarif=$out" >> "$GITHUB_ENV"
+
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: ${{ env.sarif }}
+          category: semgrep
