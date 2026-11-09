@@ -65,7 +65,7 @@ jobs:
           set -uo pipefail
           # Full scan (no baseline): code scanning tracks every open finding on
           # the default branch. Honors the repo's .semgrepignore and inline
-          # nosemgrep comments, like the PR gate.
+          # nosemgrep comments, like the PR gate (see the filter below).
           out="$RUNNER_TEMP/semgrep.sarif"
           rc=0
           semgrep scan --config "$SEMGREP_CONFIG" --metrics=off --disable-version-check \
@@ -76,8 +76,13 @@ jobs:
             echo "::error title=code-scanning::semgrep failed to run (exit $rc)"
             exit 2
           fi
+          # Drop results already suppressed in the code (inline nosemgrep with a
+          # reason, reviewed in the PR that added it). GitHub ignores SARIF
+          # `suppressions` and would show them as open alerts.
+          suppressed=$(jq '[.runs[].results[] | select((.suppressions // []) | length > 0)] | length' "$out")
+          jq '.runs |= map(.results |= map(select((.suppressions // []) | length == 0)))' "$out" > "$out.tmp" && mv "$out.tmp" "$out"
           results=$(jq '[.runs[].results[]] | length' "$out")
-          echo "::notice title=code-scanning::$results finding(s) in the full scan, uploading to code scanning"
+          echo "::notice title=code-scanning::$results finding(s) uploaded to code scanning ($suppressed suppressed in code, not uploaded)"
           echo "sarif=$out" >> "$GITHUB_ENV"
 
       - name: Upload SARIF to code scanning

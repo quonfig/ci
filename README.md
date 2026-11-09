@@ -415,8 +415,10 @@ its caller grants. That is why this is a separate caller, and not a job inside
 `ssdlc.yml`: none of the existing `ssdlc.yml` callers grant it. This repo uses
 [`code-scanning-main.yml`](.github/workflows/code-scanning-main.yml).
 
-Suppressions work as they do for `sast`: an inline `nosemgrep` is uploaded as
-a suppressed result, and `.semgrepignore` paths are skipped.
+Suppressions work as they do for `sast`: `.semgrepignore` paths are skipped,
+and a finding with an inline `nosemgrep` reason is dropped before upload
+(GitHub ignores SARIF suppressions and would show it as an open alert). The
+reason stays visible in the code and in the PR that added it.
 
 ## Overrides
 
