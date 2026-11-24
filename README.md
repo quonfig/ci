@@ -222,15 +222,27 @@ $0.02 to $0.10 budget.
   An inline `gitleaks:allow` comment on the line also works and is visible in
   review.
 - **Shared Quonfig rules** are added to every scan, whether the repo has its
-  own `.gitleaks.toml` or not. The job appends them to the repo's
-  base-branch `.gitleaks.toml` (or to the default-rules config when there is
-  none), so the repo's allowlists (including `targetRules` ones),
-  `disabledRules` and `useDefault` still apply and also cover the shared
-  rules. (Not via `[extend] path`: gitleaks drops the `targetRules`
-  allowlists of an extended config.) A repo whose `.gitleaks.toml` declares a
-  rule with the same id keeps its own declaration and the shared copy is not
-  added; do not redeclare one unless you mean to replace it. Today there is
-  one shared rule, for a committed qf1 private keyset entry:
+  own `.gitleaks.toml` or not. Without one, the job scans with the gitleaks
+  defaults plus the shared rules. With one, it parses the repo's base-branch
+  `.gitleaks.toml` as TOML (python3 `tomllib`, 3.11+) and adds each shared
+  rule to its `rules` (any valid TOML shape, inline arrays included), then
+  re-emits it as equivalent TOML. What that means for a repo config:
+  - Its allowlists (global, path and `targetRules`) apply to the shared rules
+    too, so a path allowlist can cover committed test data.
+  - `disabledRules` does **not** turn a shared rule off: it only removes rules
+    of the config the repo extends (the gitleaks defaults), and the shared
+    rules are added on top.
+  - A repo whose config really declares a rule with a shared id (a parsed
+    `[[rules]]` entry, not a comment or string) keeps its own declaration and
+    the shared copy is not added; do not redeclare one unless you mean to
+    replace it.
+  - If the config is not valid TOML, `rules` is not an array of tables, or
+    python3 has no `tomllib`, the check fails with that cause (fails closed).
+    A config that gitleaks would reject already failed the check before.
+  - Not via `[extend] path`: gitleaks drops the `targetRules` allowlists of
+    an extended config.
+
+  Today there is one shared rule, for a committed qf1 private keyset entry:
 
   ```toml
   [[rules]]
@@ -242,7 +254,9 @@ $0.02 to $0.10 budget.
 
   A `qf1-pub-` entry is not flagged; a body longer than 43 characters is (its
   first 43 match). Tests: `python3 -m unittest discover -s scripts/gitleaks`
-  (needs the pinned gitleaks on PATH), run on this repo's PRs by
+  (needs the pinned gitleaks, jq and python3 3.11+ on PATH; they run the
+  job's real Resolve and Scan step scripts from `ssdlc.yml`), run on this
+  repo's PRs by
   `.github/workflows/gitleaks-rules.yml`. Test data that must hold a private
   entry needs a path allowlist in that repo's `.gitleaks.toml`, merged before
   the data (see integration-test-data).
