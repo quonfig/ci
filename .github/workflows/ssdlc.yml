@@ -430,25 +430,9 @@ jobs:
           cfg_dir="$RUNNER_TEMP/gitleaks-cfg"
           mkdir -p "$cfg_dir"
           cfg="$cfg_dir/gitleaks.toml"
-          if git cat-file -e "$BASE_SHA:.gitleaks.toml" 2>/dev/null; then
-            git show "$BASE_SHA:.gitleaks.toml" > "$cfg"
-            echo "Using the repo's .gitleaks.toml from base ${BASE_SHA:0:7}"
-          else
-            printf '[extend]\nuseDefault = true\n' > "$cfg"
-            echo "No .gitleaks.toml on base; using the gitleaks default rules"
-          fi
-          # Shared Quonfig rules, appended to the repo's config (or to the
-          # default one) so every repo gets them. Appended, not wrapped in an
-          # [extend] path: gitleaks drops an extended config's targetRules
-          # allowlists. A repo whose config already declares a shared rule id
-          # keeps its own declaration (two rules with one id are ambiguous).
-          # Keep in step with the README ("Shared Quonfig rules").
-          qf1_id=quonfig-qf1-private-key-entry
-          if grep -Eq "^[[:space:]]*id[[:space:]]*=[[:space:]]*[\"']${qf1_id}[\"']" "$cfg"; then
-            echo "The repo's .gitleaks.toml declares $qf1_id itself; using its declaration"
-          else
-            cat >> "$cfg" <<'SHARED_RULES'
-
+          # Shared Quonfig rules, added to every repo's scan config. Keep in
+          # step with the README ("Shared Quonfig rules").
+          cat > "$cfg_dir/shared-rules.toml" <<'SHARED_RULES'
           # Shared Quonfig rule (quonfig/ci ssdlc.yml): a qf1 private keyset
           # entry, qf1-priv- + 43 unpadded base64url characters
           # (project/plans/secrets-qf1-spec.md section 6.1). The gitleaks
@@ -460,7 +444,71 @@ jobs:
           regex = '''qf1-priv-[A-Za-z0-9_-]{43}'''
           keywords = ["qf1-priv-"]
           SHARED_RULES
-            echo "Added the shared Quonfig rule $qf1_id"
+          if ! git cat-file -e "$BASE_SHA:.gitleaks.toml" 2>/dev/null; then
+            echo "No .gitleaks.toml on base; using the gitleaks default rules plus the shared Quonfig rules"
+            { printf '[extend]\nuseDefault = true\n\n'; cat "$cfg_dir/shared-rules.toml"; } > "$cfg"
+          else
+            echo "Using the repo's .gitleaks.toml from base ${BASE_SHA:0:7}"
+            git show "$BASE_SHA:.gitleaks.toml" > "$cfg_dir/repo.gitleaks.toml"
+            # Merged with a real TOML parse, not by text: a shared rule whose id
+            # the repo config really declares (in any valid TOML shape) is
+            # skipped, so the repo keeps its own declaration; otherwise the
+            # rule is added to the repo's rules and the config re-emitted as
+            # equivalent TOML. Not via [extend] path: gitleaks drops an
+            # extended config's targetRules allowlists. Fails closed (the
+            # check goes red with the cause) if this cannot be done.
+            if ! python3 -c 'import tomllib' 2>/dev/null; then
+              echo "::error title=SSDLC secrets::cannot add the shared Quonfig gitleaks rules to this repo's .gitleaks.toml: python3 with tomllib (3.11+) is required on the runner ($(python3 --version 2>&1 || echo 'python3 not found'))"
+              exit 1
+            fi
+            python3 - "$cfg_dir/repo.gitleaks.toml" "$cfg_dir/shared-rules.toml" "$cfg" <<'MERGE'
+          import json, sys, tomllib
+
+          repo_path, shared_path, out_path = sys.argv[1:4]
+
+          def fail(msg):
+              print(f"::error title=SSDLC secrets::cannot add the shared Quonfig gitleaks rules: {msg}")
+              sys.exit(1)
+
+          def toml(v):
+              if isinstance(v, bool):
+                  return "true" if v else "false"
+              if isinstance(v, (int, float)):
+                  return repr(v)
+              if isinstance(v, str):
+                  return json.dumps(v, ensure_ascii=False).replace("\x7f", "\\u007F")
+              if isinstance(v, list):
+                  return "[" + ", ".join(toml(x) for x in v) + "]"
+              if isinstance(v, dict):
+                  return "{" + ", ".join(f"{json.dumps(k)} = {toml(x)}" for k, x in v.items()) + "}"
+              fail(f"the repo's .gitleaks.toml holds a {type(v).__name__} value, which this step cannot re-emit")
+
+          raw = open(repo_path, "rb").read()
+          try:
+              cfg = tomllib.loads(raw.decode("utf-8"))
+          except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+              fail(f"the repo's .gitleaks.toml on the base branch is not valid TOML ({e}); fix it on the base branch")
+          rules = cfg.get("rules", [])
+          if not isinstance(rules, list) or not all(isinstance(r, dict) for r in rules):
+              fail("'rules' in the repo's .gitleaks.toml must be an array of tables")
+          declared = {r.get("id") for r in rules}
+          added = []
+          for rule in tomllib.load(open(shared_path, "rb"))["rules"]:
+              if rule["id"] in declared:
+                  print(f"The repo's .gitleaks.toml declares {rule['id']} itself; using its declaration")
+              else:
+                  rules.append(rule)
+                  added.append(rule["id"])
+          if not added:
+              open(out_path, "wb").write(raw)
+          else:
+              cfg["rules"] = rules
+              with open(out_path, "w", encoding="utf-8") as f:
+                  f.write("# The repo's .gitleaks.toml plus the shared Quonfig rules (quonfig/ci ssdlc.yml)\n")
+                  for k, v in cfg.items():
+                      f.write(f"{json.dumps(k)} = {toml(v)}\n")
+              print("Added the shared Quonfig rule(s): " + ", ".join(added))
+          MERGE
           fi
           if git cat-file -e "$BASE_SHA:.gitleaksignore" 2>/dev/null; then
             git show "$BASE_SHA:.gitleaksignore" > "$cfg_dir/.gitleaksignore"
