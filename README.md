@@ -222,12 +222,15 @@ $0.02 to $0.10 budget.
   An inline `gitleaks:allow` comment on the line also works and is visible in
   review.
 - **Shared Quonfig rules** are added to every scan, whether the repo has its
-  own `.gitleaks.toml` or not. The job writes a config that extends the repo's
-  `.gitleaks.toml` (or the gitleaks defaults when there is none) and appends
-  the shared rules, so the repo's allowlists, `disabledRules` and
-  `useDefault` still apply. A repo that declares a rule with the same id gets
-  one merged rule (the shared regex, both sets of allowlists), not two. Today
-  there is one shared rule, for a committed qf1 private keyset entry:
+  own `.gitleaks.toml` or not. The job appends them to the repo's
+  base-branch `.gitleaks.toml` (or to the default-rules config when there is
+  none), so the repo's allowlists (including `targetRules` ones),
+  `disabledRules` and `useDefault` still apply and also cover the shared
+  rules. (Not via `[extend] path`: gitleaks drops the `targetRules`
+  allowlists of an extended config.) A repo whose `.gitleaks.toml` declares a
+  rule with the same id keeps its own declaration and the shared copy is not
+  added; do not redeclare one unless you mean to replace it. Today there is
+  one shared rule, for a committed qf1 private keyset entry:
 
   ```toml
   [[rules]]
