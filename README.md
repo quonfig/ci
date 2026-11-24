@@ -237,8 +237,12 @@ $0.02 to $0.10 budget.
     rules are added on top.
   - A repo whose config really declares a rule with a shared id (a parsed
     rule whose `id` key, in any case or quoting, has that value; not a
-    comment or string) is used byte for byte and the shared copy is not
-    added; do not redeclare one unless you mean to replace it.
+    comment or string) is used byte for byte: the shared copy is not added
+    and no self-check runs. Such a repo can therefore weaken or switch off
+    that rule on its own base branch (for example with a narrower regex).
+    That is by design and is base-only, so it takes a reviewed, merged change
+    to that repo's config; do not redeclare a shared id unless you mean to
+    replace it.
   - The check **fails closed**, naming the cause, when appending is not
     provably right or cannot be checked: the file is not valid TOML
     (including a UTF-8 BOM, which gitleaks also rejects); `rules` is an
@@ -249,17 +253,39 @@ $0.02 to $0.10 budget.
     `tomllib`; or the self-check below fails.
   - Self-check: after assembling the config, the step runs gitleaks with it
     on a private-key-shaped string generated in `$RUNNER_TEMP` and fails
-    unless the shared rule fires (about 0.03 s). A repo config with an
-    allowlist that hides everything therefore fails the check.
+    unless the shared rule fires (about 0.03 s). It runs only when the
+    shared rule was added (not on the byte-for-byte path above). A repo
+    config whose allowlists also cover the probe (for example one that
+    hides every path) therefore fails the check; an allowlist that does not
+    match the probe does not affect it.
   - Not via `[extend] path`: gitleaks drops the `targetRules` allowlists of
     an extended config.
 
-  Trade-off: a config of unusual shape fails every PR in that repo, with
-  the cause in the log, until it is fixed on the base branch. Because the
-  config is read from base, the PR that fixes it fails the check too: the
-  escape is the documented `hotfix` path (applied by the owner, with a
-  justification and follow-up bead), or, better, have the repo owner
-  rewrite the config in the supported shape before relying on it.
+  Known false reds (no in-scope repo has any of these today), with the
+  workaround for each:
+  - A repo config with a **relative** `[extend] path`: the self-check runs
+    gitleaks from its own probe directory, where the relative path does not
+    resolve, so the step fails and only gitleaks' own log line names the
+    file. Workaround: do not use `[extend] path` in a repo config (keep
+    `useDefault = true` and put the rules in the file itself).
+  - A **global** path allowlist that happens to match the self-check
+    probe's path, `src/ssdlc-selfcheck-probe.txt` (for example `^src/` or
+    `\.txt$`), fails the self-check. Workaround: scope the allowlist with
+    `targetRules`, or make the path pattern specific to the files it is
+    meant for.
+  - A `nan` float anywhere in the config fails the post-append check (NaN is
+    never equal to itself, so the parsed result cannot be shown to equal
+    the original plus the shared rule). Workaround: do not use `nan`.
+
+  Trade-off: a config of unusual shape (or one of the false reds above)
+  fails the `secrets` check on every PR in that repo, with the cause in the
+  log, until it is fixed on the base branch. The `hotfix` label does **not**
+  get such a PR through: the Resolve step fails before the scan step, where
+  the hotfix handling lives. Because the config is read from base, the PR
+  that fixes the config fails too. The escapes that work are a fix in
+  quonfig/ci, or an org owner temporarily disabling that repo's `main-ssdlc`
+  ruleset (the documented break-glass) to merge the config fix. Better:
+  have the repo owner write the config in the supported shape from the start.
 
   Today there is one shared rule, for a committed qf1 private keyset entry:
 
@@ -521,10 +547,15 @@ the finding (for example a judgment call the model got wrong).
 
 ### `hotfix`: emergency override
 
-Adding the `hotfix` label to a PR always overrides the gate: `sanity` passes
-without running the AI, and `secrets`, `deps` and `sast` report findings as
-warnings but pass,
-so Jeff is never hard-blocked. On the first hotfix run
+Adding the `hotfix` label to a PR overrides the gate's findings: `sanity`
+passes without running the AI, and `secrets`, `deps` and `sast` report
+findings as warnings but pass,
+so Jeff is not blocked by a finding. It does not override a job that cannot
+run: in `secrets`, a gitleaks config that cannot be assembled or loaded (a
+base-branch `.gitleaks.toml` gitleaks rejects, or one the shared-rules step
+refuses, see "Shared Quonfig rules") still fails the check with the label
+on. The escape for that is a fix in quonfig/ci or the break-glass (an org
+owner temporarily disabling that repo's ruleset). On the first hotfix run
 the workflow posts one comment asking for:
 
 1. a justification comment on the PR, and
