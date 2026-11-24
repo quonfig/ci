@@ -1,0 +1,50 @@
+# Tests the shared Quonfig gitleaks rules and the config resolution of the
+# `ssdlc / secrets` job (scripts/gitleaks/test_shared_rules.py) on quonfig/ci's
+# own PRs. Uses the gitleaks version and checksum pinned in ssdlc.yml, so a
+# version bump there is tested here too. Not a required check.
+name: gitleaks-rules
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/ssdlc.yml
+      - .github/workflows/gitleaks-rules.yml
+      - scripts/gitleaks/**
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install gitleaks (version and checksum from ssdlc.yml)
+        run: |
+          set -euo pipefail
+          wf=.github/workflows/ssdlc.yml
+          version=$(sed -n 's/^ *GITLEAKS_VERSION: *\([0-9.]*\) *$/\1/p' "$wf")
+          sha=$(sed -n 's/^ *GITLEAKS_SHA256: *\([0-9a-f]*\) *$/\1/p' "$wf")
+          [ -n "$version" ] && [ -n "$sha" ] || { echo "::error::could not read the gitleaks pin from $wf"; exit 1; }
+          tarball="gitleaks_${version}_linux_x64.tar.gz"
+          dir="$RUNNER_TEMP/gitleaks"
+          mkdir -p "$dir"
+          curl -sSfL -o "$dir/$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${version}/${tarball}"
+          echo "${sha}  $dir/$tarball" | sha256sum -c -
+          tar -xzf "$dir/$tarball" -C "$dir" gitleaks
+          "$dir/gitleaks" version
+          echo "$dir" >> "$GITHUB_PATH"
+
+      - name: Test the shared rules
+        env:
+          REQUIRE_GITLEAKS: "1"
+        run: |
+          python3 --version
+          python3 -m unittest discover -v -s scripts/gitleaks

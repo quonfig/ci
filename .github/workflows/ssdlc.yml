@@ -429,12 +429,137 @@ jobs:
           # .gitleaksignore take effect once merged.
           cfg_dir="$RUNNER_TEMP/gitleaks-cfg"
           mkdir -p "$cfg_dir"
-          if git cat-file -e "$BASE_SHA:.gitleaks.toml" 2>/dev/null; then
-            git show "$BASE_SHA:.gitleaks.toml" > "$cfg_dir/gitleaks.toml"
-            echo "Using the repo's .gitleaks.toml from base ${BASE_SHA:0:7}"
+          cfg="$cfg_dir/gitleaks.toml"
+          # Shared Quonfig rules, added to every repo's scan config. Keep in
+          # step with the README ("Shared Quonfig rules").
+          cat > "$cfg_dir/shared-rules.toml" <<'SHARED_RULES'
+          # Shared Quonfig rule (quonfig/ci ssdlc.yml): a qf1 private keyset
+          # entry, qf1-priv- + 43 unpadded base64url characters
+          # (project/plans/secrets-qf1-spec.md section 6.1). The gitleaks
+          # defaults do not flag a bare entry. A longer body is flagged too
+          # (its first 43 characters match); qf1-pub- is not.
+          [[rules]]
+          id = "quonfig-qf1-private-key-entry"
+          description = "Quonfig qf1 private keyset entry (qf1-priv- + 43 base64url characters)"
+          regex = '''qf1-priv-[A-Za-z0-9_-]{43}'''
+          keywords = ["qf1-priv-"]
+          SHARED_RULES
+          qf1_id=quonfig-qf1-private-key-entry
+          appended=true
+          if ! git cat-file -e "$BASE_SHA:.gitleaks.toml" 2>/dev/null; then
+            echo "No .gitleaks.toml on base; using the gitleaks default rules plus the shared Quonfig rules"
+            { printf '[extend]\nuseDefault = true\n\n'; cat "$cfg_dir/shared-rules.toml"; } > "$cfg"
           else
-            printf '[extend]\nuseDefault = true\n' > "$cfg_dir/gitleaks.toml"
-            echo "No .gitleaks.toml on base; using the gitleaks default rules"
+            echo "Using the repo's .gitleaks.toml from base ${BASE_SHA:0:7}"
+            git show "$BASE_SHA:.gitleaks.toml" > "$cfg_dir/repo.gitleaks.toml"
+            # The repo's config is never rewritten: the final config is its
+            # exact bytes, plus (unless a parsed rule already declares the
+            # shared id) the shared rule block appended at the end. tomllib is
+            # used only to DECIDE and to VERIFY the result, and fails closed,
+            # with the cause, on any shape where appending is not provably
+            # right. Not via [extend] path: gitleaks drops an extended config's
+            # targetRules allowlists.
+            # Python runs isolated (-I: no current directory or script
+            # directory on sys.path, no PYTHON* variables, no user site) from
+            # an empty directory, never from the PR checkout, so a tomllib.py,
+            # json.py or sitecustomize.py in the PR cannot be imported.
+            py_dir="$RUNNER_TEMP/gitleaks-py"
+            mkdir -p "$py_dir"
+            if ! (cd "$py_dir" && python3 -I -c 'import tomllib') 2>/dev/null; then
+              echo "::error title=SSDLC secrets::cannot add the shared Quonfig gitleaks rules to this repo's .gitleaks.toml: python3 with tomllib (3.11+) is required on the runner ($(python3 --version 2>&1 || echo 'python3 not found'))"
+              exit 1
+            fi
+            rc=0
+            (cd "$py_dir" && python3 -I - "$cfg_dir/repo.gitleaks.toml" "$cfg_dir/shared-rules.toml" "$cfg") <<'DECIDE' || rc=$?
+          import sys, tomllib
+
+          repo_path, shared_path, out_path = sys.argv[1:4]
+          FIX = "Fix the repo's .gitleaks.toml on the base branch (see quonfig/ci README, 'Shared Quonfig rules')."
+
+          def fail(msg):
+              print(f"::error title=SSDLC secrets::cannot add the shared Quonfig gitleaks rules: {msg}. {FIX}")
+              sys.exit(1)
+
+          def parse(raw, what):
+              try:
+                  return tomllib.loads(raw.decode("utf-8"))
+              except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+                  fail(f"{what} is not valid TOML ({e})")
+
+          def rule_ids(rules):
+              # gitleaks reads keys case-insensitively, so `ID = ...` declares too.
+              return [v for r in rules for k, v in r.items() if k.lower() == "id"]
+
+          raw = open(repo_path, "rb").read()
+          shared_raw = open(shared_path, "rb").read()
+          cfg = parse(raw, "the repo's .gitleaks.toml")
+          shared = tomllib.loads(shared_raw.decode("utf-8"))["rules"]
+
+          # (c) Can a [[rules]] block appended to these bytes be the rule gitleaks applies?
+          odd = [k for k in cfg if k.lower() == "rules" and k != "rules"]
+          if odd:
+              fail(f"it defines rules under the key {odd[0]!r}; gitleaks would not apply a [[rules]] table added next to it. Rename it to `rules` ([[rules]] tables)")
+          rules = cfg.get("rules", [])
+          if isinstance(rules, dict):
+              fail("`rules` is a single table ([rules]); a shared [[rules]] table cannot be added to it. Write each rule as a [[rules]] table")
+          if not isinstance(rules, list) or not all(isinstance(r, dict) for r in rules):
+              fail(f"`rules` is a {type(rules).__name__}, not an array of tables. Write each rule as a [[rules]] table")
+
+          ids = rule_ids(rules)
+          missing = [r for r in shared if r["id"] not in ids]
+          for r in shared:
+              if r["id"] in ids:
+                  print(f"The repo's .gitleaks.toml declares {r['id']} itself; using its declaration")
+          if not missing:
+              open(out_path, "wb").write(raw)
+              sys.exit(3)  # nothing appended
+
+          # Append: the original bytes untouched, then the shared block, in the
+          # file's own line ending.
+          nl = b"\r\n" if b"\r\n" in raw else b"\n"
+          block = shared_raw.replace(b"\r\n", b"\n").replace(b"\n", nl)
+          sep = b"" if raw == b"" or raw.endswith(b"\n") else nl
+          final = raw + sep + nl + block
+          if len(missing) != len(shared):
+              fail("only some of the shared rules are declared by the repo; this step cannot add the rest")
+
+          # Verify, do not assume: the result parses, every key but `rules` is
+          # unchanged, and `rules` is the repo's rules plus the shared ones.
+          try:
+              after = tomllib.loads(final.decode("utf-8"))
+          except tomllib.TOMLDecodeError as e:
+              fail(f"appending a [[rules]] table to it is not valid TOML ({e}); this happens when `rules` is an inline array (rules = [...]). Write each rule as a [[rules]] table")
+          if {k: v for k, v in after.items() if k != "rules"} != {k: v for k, v in cfg.items() if k != "rules"} \
+                  or after.get("rules") != rules + shared \
+                  or any(rule_ids(after["rules"]).count(r["id"]) != 1 for r in shared):
+              fail("after appending the shared rules the config does not parse to the repo's config plus exactly one copy of each shared rule")
+          open(out_path, "wb").write(final)
+          print("Appended the shared Quonfig rule(s): " + ", ".join(r["id"] for r in shared))
+          DECIDE
+            case "$rc" in
+              0) ;;
+              3) appended=false ;;
+              *) exit 1 ;;
+            esac
+          fi
+          if [ "$appended" = true ]; then
+            # Self-check: the final config must make gitleaks itself fire the
+            # shared rule on a private-key-shaped string generated here (never
+            # in the checkout), since tomllib and gitleaks' TOML parser can
+            # disagree. Run outside the checkout with an empty ignore file.
+            probe="$RUNNER_TEMP/gitleaks-selfcheck"
+            mkdir -p "$probe/src"
+            : > "$probe/ignore"
+            entry_body=$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n' | cut -c1-43)
+            printf 'qf1-%s%s\n' 'priv-' "$entry_body" > "$probe/src/ssdlc-selfcheck-probe.txt"
+            if ! (cd "$probe" && gitleaks dir src --config "$cfg" --gitleaks-ignore-path "$probe/ignore" \
+                  --no-banner --redact --log-level error --report-format json \
+                  --report-path "$probe/report.json" --exit-code 0) \
+               || ! jq -e --arg id "$qf1_id" 'any(.[]; .RuleID == $id)' "$probe/report.json" > /dev/null; then
+              echo "::error title=SSDLC secrets::self-check failed: with the assembled config gitleaks does not report $qf1_id on a generated private-key-shaped entry (config error, or an allowlist in the repo's .gitleaks.toml hides it). Fix the repo's .gitleaks.toml on the base branch."
+              exit 1
+            fi
+            echo "Self-check passed: gitleaks reports $qf1_id with the assembled config"
           fi
           if git cat-file -e "$BASE_SHA:.gitleaksignore" 2>/dev/null; then
             git show "$BASE_SHA:.gitleaksignore" > "$cfg_dir/.gitleaksignore"
