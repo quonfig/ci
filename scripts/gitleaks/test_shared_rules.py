@@ -549,6 +549,43 @@ class SharedRulesTest(unittest.TestCase):
                 self.assertEqual({k for k in after - before if k[2] != RULE}, set())
                 self.assertIn(("a.txt", 1, RULE), after)
 
+    # --- pinned details of the append path ------------------------------------
+
+    def test_post_append_verification_rejects_a_mismatch(self) -> None:
+        # Known false red, pinned: NaN is never equal to itself, so the parsed
+        # result cannot be shown to equal original + shared rule and the
+        # verification fails closed. This is the reachable case that proves
+        # the equality check runs.
+        base = {".gitleaks.toml": "[extend]\nuseDefault = true\n\n[[rules]]\nid = \"own-rule\"\n"
+                                  "regex = '''own-[0-9]{6}'''\nentropy = nan\n"}
+        r = self.job({"a.txt": priv() + "\n"}, base)
+        self.assert_resolve_fails(r, "does not parse to the repo's config plus exactly one copy")
+
+    CRLF_CONFIG = "[extend]\r\nuseDefault = true\r\n\r\n[[rules]]\r\nid = \"own-rule\"\r\nregex = '''own-[0-9]{6}'''\r\n"
+
+    def test_appended_block_uses_the_files_line_ending(self) -> None:
+        r = self.job({"a.txt": priv() + "\n"}, {".gitleaks.toml": self.CRLF_CONFIG})
+        self.assertEqual(r.resolve.returncode, 0, r.resolve.stdout + r.resolve.stderr)
+        original = self.CRLF_CONFIG.encode()
+        self.assertTrue(r.config.startswith(original))
+        tail = r.config[len(original):]
+        self.assertIn(RULE.encode(), tail)
+        self.assertEqual(tail.count(b"\n"), tail.count(b"\r\n"), "every appended line must end in CRLF")
+
+    def test_declared_crlf_config_is_used_byte_for_byte(self) -> None:
+        text = "[extend]\r\nuseDefault = true\r\n\r\n" + self.NARROW_RULE.replace("\n", "\r\n")
+        r = self.job({"a.txt": self.narrowed_pair()}, {".gitleaks.toml": text})
+        self.assertEqual(r.resolve.returncode, 0, r.resolve.stdout + r.resolve.stderr)
+        self.assertEqual(r.config, text.encode())
+        self.assertEqual(self.hits(r.findings), [("a.txt", 1)])
+
+    def test_self_check_probe_is_created_outside_the_checkout(self) -> None:
+        for base in ({}, {".gitleaks.toml": "[extend]\nuseDefault = true\n"}):
+            with self.subTest(repo_config=bool(base)):
+                r = self.job({"a.txt": priv() + "\n"}, base)
+                self.assertIn("Self-check passed", r.resolve.stdout)
+                self.assertEqual(r.repo.git("status", "--porcelain", "--untracked-files=all", "--ignored"), "")
+
     def test_steps_extracted(self) -> None:
         self.assertIn(RULE, step_script(RESOLVE_STEP))
         self.assertIn("gitleaks git .", step_script(SCAN_STEP))
