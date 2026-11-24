@@ -429,12 +429,38 @@ jobs:
           # .gitleaksignore take effect once merged.
           cfg_dir="$RUNNER_TEMP/gitleaks-cfg"
           mkdir -p "$cfg_dir"
+          cfg="$cfg_dir/gitleaks.toml"
           if git cat-file -e "$BASE_SHA:.gitleaks.toml" 2>/dev/null; then
-            git show "$BASE_SHA:.gitleaks.toml" > "$cfg_dir/gitleaks.toml"
+            git show "$BASE_SHA:.gitleaks.toml" > "$cfg"
             echo "Using the repo's .gitleaks.toml from base ${BASE_SHA:0:7}"
           else
-            printf '[extend]\nuseDefault = true\n' > "$cfg_dir/gitleaks.toml"
+            printf '[extend]\nuseDefault = true\n' > "$cfg"
             echo "No .gitleaks.toml on base; using the gitleaks default rules"
+          fi
+          # Shared Quonfig rules, appended to the repo's config (or to the
+          # default one) so every repo gets them. Appended, not wrapped in an
+          # [extend] path: gitleaks drops an extended config's targetRules
+          # allowlists. A repo whose config already declares a shared rule id
+          # keeps its own declaration (two rules with one id are ambiguous).
+          # Keep in step with the README ("Shared Quonfig rules").
+          qf1_id=quonfig-qf1-private-key-entry
+          if grep -Eq "^[[:space:]]*id[[:space:]]*=[[:space:]]*[\"']${qf1_id}[\"']" "$cfg"; then
+            echo "The repo's .gitleaks.toml declares $qf1_id itself; using its declaration"
+          else
+            cat >> "$cfg" <<'SHARED_RULES'
+
+          # Shared Quonfig rule (quonfig/ci ssdlc.yml): a qf1 private keyset
+          # entry, qf1-priv- + 43 unpadded base64url characters
+          # (project/plans/secrets-qf1-spec.md section 6.1). The gitleaks
+          # defaults do not flag a bare entry. A longer body is flagged too
+          # (its first 43 characters match); qf1-pub- is not.
+          [[rules]]
+          id = "quonfig-qf1-private-key-entry"
+          description = "Quonfig qf1 private keyset entry (qf1-priv- + 43 base64url characters)"
+          regex = '''qf1-priv-[A-Za-z0-9_-]{43}'''
+          keywords = ["qf1-priv-"]
+          SHARED_RULES
+            echo "Added the shared Quonfig rule $qf1_id"
           fi
           if git cat-file -e "$BASE_SHA:.gitleaksignore" 2>/dev/null; then
             git show "$BASE_SHA:.gitleaksignore" > "$cfg_dir/.gitleaksignore"

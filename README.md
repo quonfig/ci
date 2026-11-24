@@ -221,6 +221,28 @@ $0.02 to $0.10 budget.
   cannot allowlist its own leak; a change to them takes effect once merged.
   An inline `gitleaks:allow` comment on the line also works and is visible in
   review.
+- **Shared Quonfig rules** are added to every scan, whether the repo has its
+  own `.gitleaks.toml` or not. The job writes a config that extends the repo's
+  `.gitleaks.toml` (or the gitleaks defaults when there is none) and appends
+  the shared rules, so the repo's allowlists, `disabledRules` and
+  `useDefault` still apply. A repo that declares a rule with the same id gets
+  one merged rule (the shared regex, both sets of allowlists), not two. Today
+  there is one shared rule, for a committed qf1 private keyset entry:
+
+  ```toml
+  [[rules]]
+  id = "quonfig-qf1-private-key-entry"
+  description = "Quonfig qf1 private keyset entry (qf1-priv- + 43 base64url characters)"
+  regex = '''qf1-priv-[A-Za-z0-9_-]{43}'''
+  keywords = ["qf1-priv-"]
+  ```
+
+  A `qf1-pub-` entry is not flagged; a body longer than 43 characters is (its
+  first 43 match). Tests: `python3 -m unittest discover -s scripts/gitleaks`
+  (needs the pinned gitleaks on PATH), run on this repo's PRs by
+  `.github/workflows/gitleaks-rules.yml`. Test data that must hold a private
+  entry needs a path allowlist in that repo's `.gitleaks.toml`, merged before
+  the data (see integration-test-data).
 - A real leaked credential must be rotated; removing it from the branch is not
   enough once it has been pushed.
 
