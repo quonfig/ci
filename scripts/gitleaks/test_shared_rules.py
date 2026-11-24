@@ -113,8 +113,9 @@ class Repo:
 
 
 class Run:
-    def __init__(self, resolve: subprocess.CompletedProcess, scan: subprocess.CompletedProcess | None, findings: list[dict]):
-        self.resolve, self.scan, self.findings = resolve, scan, findings
+    def __init__(self, repo: Repo, resolve: subprocess.CompletedProcess, scan: subprocess.CompletedProcess | None,
+                 findings: list[dict], config: bytes | None):
+        self.repo, self.resolve, self.scan, self.findings, self.config = repo, resolve, scan, findings, config
 
 
 # CI sets REQUIRE_GITLEAKS=1 so a missing binary fails instead of skipping.
@@ -124,7 +125,8 @@ class SharedRulesTest(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp()).resolve()
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
-    def job(self, pr_files: dict[str, str | None], base_files: dict[str, str] | None = None, path_prefix: str = "") -> Run:
+    def job(self, pr_files: dict[str, str | None], base_files: dict[str, str] | None = None, path_prefix: str = "",
+            extra_env: dict[str, str] | None = None) -> Run:
         """Run the job's Resolve step, then (if it passed) its Scan step, like the job does."""
         root = self.tmp / f"case{len(list(self.tmp.iterdir()))}"
         root.mkdir()
@@ -141,15 +143,17 @@ class SharedRulesTest(unittest.TestCase):
             "HAS_HOTFIX": "false",
             "RUNNER_TEMP": str(runner_temp),
             "GITHUB_OUTPUT": str(output),
+            **(extra_env or {}),
         }
         resolve = subprocess.run(["bash", "-e", "-c", step_script(RESOLVE_STEP)], cwd=repo.path, env=env, capture_output=True, text=True)
         if resolve.returncode != 0:
-            return Run(resolve, None, [])
+            return Run(repo, resolve, None, [], None)
         env["CFG_DIR"] = dict(l.split("=", 1) for l in output.read_text().splitlines())["dir"]
+        config = (Path(env["CFG_DIR"]) / "gitleaks.toml").read_bytes()
         scan = subprocess.run(["bash", "-e", "-c", step_script(SCAN_STEP)], cwd=repo.path, env=env, capture_output=True, text=True)
         report = runner_temp / "gitleaks-report.json"
         findings = json.loads(report.read_text()) if report.exists() and report.stat().st_size else []
-        return Run(resolve, scan, findings)
+        return Run(repo, resolve, scan, findings, config)
 
     def scan(self, pr_files: dict[str, str | None], base_files: dict[str, str] | None = None) -> list[dict]:
         """Findings of a job run that must resolve and scan cleanly; the Scan step's exit code must match."""
@@ -341,16 +345,6 @@ class SharedRulesTest(unittest.TestCase):
         f = self.scan({"a.txt": priv() + "\n"}, base)
         self.assertEqual(self.hits(f), [("a.txt", 1)])
 
-    def test_inline_rules_array_is_merged(self) -> None:
-        # `rules = [{...}]` cannot take an appended [[rules]] table; the job
-        # merges by parse and re-emits, so both rules are in force.
-        base = {".gitleaks.toml": "rules = [{id = \"own-rule\", regex = '''own-[0-9]{6}'''}]\n"
-                                  "[extend]\nuseDefault = true\n"}
-        f = self.scan({"a.txt": f"{priv()}\nown-123456\ntoken = {github_pat()}\n"}, base)
-        self.assertEqual(self.hits(f), [("a.txt", 1)])
-        self.assertEqual(self.hits(f, "own-rule"), [("a.txt", 2)])
-        self.assertEqual(self.hits(f, "github-pat"), [("a.txt", 3)])
-
     def test_repo_config_without_trailing_newline(self) -> None:
         f = self.scan({"a.txt": priv() + "\n"}, {".gitleaks.toml": "[extend]\nuseDefault = true"})
         self.assertEqual(self.hits(f), [("a.txt", 1)])
@@ -368,7 +362,7 @@ class SharedRulesTest(unittest.TestCase):
 
     def test_rules_not_an_array_of_tables_fails_closed(self) -> None:
         r = self.job({"a.txt": "x\n"}, {".gitleaks.toml": 'rules = "nope"\n'})
-        self.assert_resolve_fails(r, "must be an array of tables")
+        self.assert_resolve_fails(r, "`rules` is a str, not an array of tables")
 
     def test_missing_tomllib_fails_closed(self) -> None:
         # A python3 without tomllib on PATH: a repo with its own config fails
@@ -383,6 +377,177 @@ class SharedRulesTest(unittest.TestCase):
         r = self.job({"a.txt": priv() + "\n"}, path_prefix=f"{fake}:")
         self.assertEqual(r.resolve.returncode, 0, r.resolve.stdout + r.resolve.stderr)
         self.assertEqual(self.hits(r.findings), [("a.txt", 1)])
+
+    # --- unusual config shapes: append when provably right, else fail closed --
+
+    def test_inline_rules_array_fails_closed(self) -> None:
+        # `rules = [{...}]` cannot take an appended [[rules]] table.
+        r = self.job({"a.txt": priv() + "\n"}, {".gitleaks.toml":
+                     "rules = [{id = \"own-rule\", regex = '''own-[0-9]{6}'''}]\n[extend]\nuseDefault = true\n"})
+        self.assert_resolve_fails(r, "inline array")
+
+    def test_single_table_rules_fails_closed(self) -> None:
+        r = self.job({"a.txt": priv() + "\n"}, {".gitleaks.toml":
+                     "[rules]\nid = \"own-rule\"\nregex = '''own-[0-9]{6}'''\n"})
+        self.assert_resolve_fails(r, "single table")
+
+    def test_capitalised_rules_key_fails_closed(self) -> None:
+        # gitleaks keeps [[Rules]] and silently ignores an added lowercase [[rules]].
+        r = self.job({"a.txt": priv() + "\n"}, {".gitleaks.toml":
+                     "[extend]\nuseDefault = true\n\n[[Rules]]\nid = \"own-rule\"\nregex = '''own-[0-9]{6}'''\n"})
+        self.assert_resolve_fails(r, "'Rules'")
+
+    def test_bom_fails_closed(self) -> None:
+        # gitleaks itself rejects a BOM ("invalid character at start of key"),
+        # so this config already failed the check before.
+        r = self.job({"a.txt": priv() + "\n"}, {".gitleaks.toml": "﻿[extend]\nuseDefault = true\n"})
+        self.assert_resolve_fails(r, "not valid TOML")
+
+    def test_empty_config_gets_the_rule(self) -> None:
+        r = self.job({"a.txt": priv() + "\n", "t.txt": f"token = {github_pat()}\n"}, {".gitleaks.toml": ""})
+        self.assertEqual(r.resolve.returncode, 0, r.resolve.stdout + r.resolve.stderr)
+        self.assertEqual(self.hits(r.findings), [("a.txt", 1)])
+        self.assertEqual(self.hits(r.findings, "github-pat"), [])  # an empty config has no defaults
+
+    def test_uppercase_id_key_is_a_declaration(self) -> None:
+        # gitleaks reads keys case-insensitively: `ID = ...` declares the rule,
+        # so the file is used byte for byte.
+        base = {".gitleaks.toml": "[extend]\nuseDefault = true\n\n" + self.NARROW_RULE.replace("\nid = ", "\nID = ")}
+        r = self.job({"a.txt": self.narrowed_pair()}, base)
+        self.assertEqual(self.hits(r.findings), [("a.txt", 1)])
+        self.assertEqual(r.config, base[".gitleaks.toml"].encode())
+
+    def test_per_rule_allowlists_survive(self) -> None:
+        base = {".gitleaks.toml": textwrap.dedent("""\
+            [extend]
+            useDefault = true
+
+            [[rules]]
+            id = "own-rule"
+            regex = '''own-[0-9]{6}'''
+
+            [[rules.allowlists]]
+            paths = ['''^b\\.txt$''']
+            """)}
+        f = self.scan({"a.txt": f"{priv()}\nown-123456\n", "b.txt": f"own-123456\n{priv()}\n"}, base)
+        self.assertEqual(self.hits(f, "own-rule"), [("a.txt", 2)])
+        # The appended block is a new top-level rule, not part of own-rule:
+        # own-rule's per-rule allowlist does not hide it in b.txt.
+        self.assertEqual(self.hits(f), [("a.txt", 1), ("b.txt", 2)])
+
+    def test_last_table_extend_gets_a_top_level_rule(self) -> None:
+        base = {".gitleaks.toml": "[[rules]]\nid = \"own-rule\"\nregex = '''own-[0-9]{6}'''\n\n[extend]\nuseDefault = true"}
+        f = self.scan({"a.txt": f"{priv()}\nown-123456\n"}, base)
+        self.assertEqual(self.hits(f), [("a.txt", 1)])
+        self.assertEqual(self.hits(f, "own-rule"), [("a.txt", 2)])
+
+    def test_allow_everything_repo_config_fails_the_self_check(self) -> None:
+        # A base config whose allowlist hides everything would hide the shared
+        # rule too: the step's self-check fails closed instead of scanning.
+        base = {".gitleaks.toml": "[extend]\nuseDefault = true\n\n[[allowlists]]\npaths = ['''.*''']\n"}
+        r = self.job({"a.txt": priv() + "\n"}, base)
+        self.assert_resolve_fails(r, "self-check failed")
+
+    def test_python_cannot_be_hijacked_from_the_pr(self) -> None:
+        # The PR plants modules python would import from the checkout, or from
+        # PYTHONPATH/PYTHONSTARTUP pointed at the checkout as a hostile
+        # environment would. Each leaves a marker; the fake tomllib also makes
+        # the config look "declared" so the shared rule would be skipped.
+        # None may run, and the planted secrets must still be reported.
+        markers = self.tmp / "markers"
+        markers.mkdir()
+
+        def planted(name: str, extra: str = "") -> str:
+            return f"import pathlib\npathlib.Path({str(markers / name)!r}).write_text('ran')\n{extra}"
+
+        fake_tomllib = planted("tomllib", (
+            "class TOMLDecodeError(Exception):\n    pass\n"
+            f"def loads(s, **k):\n    return {{'rules': [{{'id': {RULE!r}}}]}}\n"
+            "def load(f, **k):\n    return loads('')\n"))
+        pr = {
+            "a.txt": priv() + "\n",
+            "t.txt": f"token = {github_pat()}\n",
+            "tomllib.py": fake_tomllib,
+            "json.py": planted("json"),
+            "sitecustomize.py": planted("sitecustomize"),
+            "usercustomize.py": planted("usercustomize"),
+        }
+        checkout = self.tmp / f"case{len(list(self.tmp.iterdir()))}" / "repo"
+        hostile = {"PYTHONPATH": str(checkout), "PYTHONSTARTUP": str(checkout / "json.py"), "PYTHONINSPECT": "1"}
+        r = self.job(pr, {".gitleaks.toml": "[extend]\nuseDefault = true\n"}, extra_env=hostile)
+        self.assertEqual(r.repo.path, checkout)
+        self.assertEqual(sorted(p.name for p in markers.iterdir()), [])
+        self.assertEqual(r.resolve.returncode, 0, r.resolve.stdout + r.resolve.stderr)
+        self.assertEqual(self.hits(r.findings), [("a.txt", 1)])
+        self.assertEqual(self.hits(r.findings, "github-pat"), [("t.txt", 1)])
+        self.assertEqual(r.scan.returncode, 1)
+
+    # --- fidelity: the repo's bytes are never rewritten -----------------------
+
+    FIDELITY_CONFIGS = {
+        "plain": "[extend]\nuseDefault = true\n",
+        "own rules, per-rule and targeted allowlists": textwrap.dedent("""\
+            title = "x"
+            [extend]
+            useDefault = true
+            disabledRules = ["github-pat"]
+
+            [[rules]]
+            id = "own-rule"
+            regex = '''own-[0-9]{6}'''
+            [[rules.allowlists]]
+            paths = ['''^b\\.txt$''']
+
+            [[allowlists]]
+            targetRules = ["generic-api-key"]
+            regexTarget = "line"
+            regexes = ['''^\\s*(?:-\\s+)?"?key"?:\\s*"qf1\\.[a-z0-9.]+",?\\s*$''']
+            """),
+        "CRLF, line break inside a rule regex":
+            "[extend]\r\nuseDefault = true\r\n\r\n[[rules]]\r\nid = \"own-rule\"\r\n"
+            "regex = '''\r\nown-[0-9]{6}|zz\r\nqq'''\r\n",
+        "CRLF, line break inside an allowlist regex":
+            "[extend]\r\nuseDefault = true\r\n\r\n[[rules]]\r\nid = \"own-rule\"\r\nregex = '''own-[0-9]{6}'''\r\n"
+            "[[rules.allowlists]]\r\nregexes = ['''\r\nown-111111\r\n|own-222222''']\r\n",
+        "last table [[rules.allowlists]], no trailing newline":
+            "[extend]\nuseDefault = true\n\n[[rules]]\nid = \"own-rule\"\nregex = '''own-[0-9]{6}'''\n"
+            "[[rules.allowlists]]\nregexes = ['''own-222222''']",
+        "id only in a comment and a string":
+            f'# id = "{RULE}"\ndescription = """\nid = "{RULE}"\n"""\n[extend]\nuseDefault = true\n',
+        "empty": "",
+    }
+
+    def fidelity_corpus(self) -> dict[str, str]:
+        return {
+            "a.txt": f"{priv()}\nown-123456\nown-111111\nown-222222\ntoken = {github_pat()}\n",
+            "b.txt": f"own-123456\n{priv()}\n",
+            "c.yaml": self.KEY_LINE,
+        }
+
+    def test_fidelity_bytes_kept_and_findings_superset(self) -> None:
+        for i, (name, text) in enumerate(self.FIDELITY_CONFIGS.items()):
+            with self.subTest(config=name):
+                original = text.encode()
+                r = self.job(self.fidelity_corpus(), {".gitleaks.toml": text})
+                self.assertEqual(r.resolve.returncode, 0, r.resolve.stdout + r.resolve.stderr)
+                self.assertTrue(r.config.startswith(original), "the repo's bytes must be kept as they are")
+                # Findings with the repo's original config alone, same range.
+                cfg = self.tmp / f"orig-{i}.toml"
+                cfg.write_bytes(original)
+                report = self.tmp / f"orig-{i}.json"
+                subprocess.run(["gitleaks", "git", str(r.repo.path), f"--log-opts={r.repo.base}..{r.repo.head}",
+                                "--config", str(cfg), "--gitleaks-ignore-path", str(self.tmp / "none"), "--no-banner",
+                                "--report-format", "json", "--report-path", str(report), "--exit-code", "0"],
+                               check=True, capture_output=True)
+
+                def key(f: dict) -> tuple[str, int, str]:
+                    return (f["File"], f["StartLine"], f["RuleID"])
+
+                before = {key(f) for f in json.loads(report.read_text())}
+                after = {key(f) for f in r.findings}
+                self.assertLessEqual(before, after)
+                self.assertEqual({k for k in after - before if k[2] != RULE}, set())
+                self.assertIn(("a.txt", 1, RULE), after)
 
     def test_steps_extracted(self) -> None:
         self.assertIn(RULE, step_script(RESOLVE_STEP))
