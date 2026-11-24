@@ -223,24 +223,43 @@ $0.02 to $0.10 budget.
   review.
 - **Shared Quonfig rules** are added to every scan, whether the repo has its
   own `.gitleaks.toml` or not. Without one, the job scans with the gitleaks
-  defaults plus the shared rules. With one, it parses the repo's base-branch
-  `.gitleaks.toml` as TOML (python3 `tomllib`, 3.11+) and adds each shared
-  rule to its `rules` (any valid TOML shape, inline arrays included), then
-  re-emits it as equivalent TOML. What that means for a repo config:
+  defaults plus the shared rules. With one, the repo's base-branch file is
+  **never rewritten**: the scan config is its exact bytes with the shared
+  rule block appended at the end (in the file's own line ending). python3
+  `tomllib` (3.11+, run isolated with `-I` from an empty directory, never
+  from the PR checkout) is used only to decide whether appending is right
+  and to verify the result. What that means for a repo config:
   - Its allowlists (global, path and `targetRules`) apply to the shared rules
-    too, so a path allowlist can cover committed test data.
+    too, so a path allowlist can cover committed test data. Per-rule
+    allowlists stay with their own rule.
   - `disabledRules` does **not** turn a shared rule off: it only removes rules
     of the config the repo extends (the gitleaks defaults), and the shared
     rules are added on top.
   - A repo whose config really declares a rule with a shared id (a parsed
-    `[[rules]]` entry, not a comment or string) keeps its own declaration and
-    the shared copy is not added; do not redeclare one unless you mean to
-    replace it.
-  - If the config is not valid TOML, `rules` is not an array of tables, or
-    python3 has no `tomllib`, the check fails with that cause (fails closed).
-    A config that gitleaks would reject already failed the check before.
+    rule whose `id` key, in any case or quoting, has that value; not a
+    comment or string) is used byte for byte and the shared copy is not
+    added; do not redeclare one unless you mean to replace it.
+  - The check **fails closed**, naming the cause, when appending is not
+    provably right or cannot be checked: the file is not valid TOML
+    (including a UTF-8 BOM, which gitleaks also rejects); `rules` is an
+    inline array (`rules = [...]`), a single `[rules]` table or another
+    type; the rules key is spelled differently (`[[Rules]]`: gitleaks would
+    ignore an added `[[rules]]`); the appended file does not parse to the
+    original plus exactly one copy of each shared rule; python3 has no
+    `tomllib`; or the self-check below fails.
+  - Self-check: after assembling the config, the step runs gitleaks with it
+    on a private-key-shaped string generated in `$RUNNER_TEMP` and fails
+    unless the shared rule fires (about 0.03 s). A repo config with an
+    allowlist that hides everything therefore fails the check.
   - Not via `[extend] path`: gitleaks drops the `targetRules` allowlists of
     an extended config.
+
+  Trade-off: a config of unusual shape fails every PR in that repo, with
+  the cause in the log, until it is fixed on the base branch. Because the
+  config is read from base, the PR that fixes it fails the check too: the
+  escape is the documented `hotfix` path (applied by the owner, with a
+  justification and follow-up bead), or, better, have the repo owner
+  rewrite the config in the supported shape before relying on it.
 
   Today there is one shared rule, for a committed qf1 private keyset entry:
 
