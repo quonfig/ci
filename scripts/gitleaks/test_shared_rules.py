@@ -1,10 +1,14 @@
 """Tests for the shared Quonfig gitleaks rules in the `ssdlc / secrets` job.
 
-They run the job's real "Resolve config from the base branch" script, taken
-from .github/workflows/ssdlc.yml, against throwaway git repos, then scan the
-PR range with gitleaks the way the "Scan PR commits" step does. Needs the
-gitleaks binary on PATH (the version pinned in ssdlc.yml). Run with:
+They run the job's real "Resolve config from the base branch" and "Scan PR
+commits (base..head)" scripts, both taken from .github/workflows/ssdlc.yml,
+in throwaway git repos with a base commit and a PR commit. Needs the gitleaks
+binary on PATH (the version pinned in ssdlc.yml), jq, and python3 3.11+ (the
+resolve step uses tomllib). Run with:
     python3 -m unittest discover -s scripts/gitleaks
+
+SSDLC_WORKFLOW=<path> runs the tests against another copy of ssdlc.yml (used
+to check that mutations of the step go red).
 
 No private-key-shaped literal is committed here: every qf1 entry is built at
 run time from random bytes, so this file passes the gate it tests.
@@ -15,9 +19,9 @@ from __future__ import annotations
 import base64
 import json
 import os
-import re
 import secrets
 import shutil
+import stat
 import string
 import subprocess
 import tempfile
@@ -25,16 +29,18 @@ import textwrap
 import unittest
 from pathlib import Path
 
-WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ssdlc.yml"
+WORKFLOW = Path(os.environ.get("SSDLC_WORKFLOW") or Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ssdlc.yml")
+RESOLVE_STEP = "Resolve config from the base branch"
+SCAN_STEP = "Scan PR commits (base..head)"
 RULE = "quonfig-qf1-private-key-entry"
 PRIV = "qf1-" + "priv-"  # split so this file holds no rule match
 PUB = "qf1-" + "pub-"
 
 
-def resolve_script() -> str:
-    """The `run: |` block of the "Resolve config from the base branch" step."""
+def step_script(name: str) -> str:
+    """The `run: |` block of the secrets job step called `name`."""
     lines = WORKFLOW.read_text().splitlines()
-    start = next(i for i, l in enumerate(lines) if l.strip() == "- name: Resolve config from the base branch")
+    start = next(i for i, l in enumerate(lines) if l.strip() == f"- name: {name}")
     run = next(i for i in range(start, len(lines)) if lines[i].strip() == "run: |")
     body: list[str] = []
     indent = None
@@ -52,7 +58,7 @@ def resolve_script() -> str:
 
 
 def body(n: int = 43) -> str:
-    """n base64url characters, never all from one class (looks like a real key)."""
+    """n random base64url characters."""
     raw = base64.urlsafe_b64encode(secrets.token_bytes(48)).decode().rstrip("=")
     return raw[:n]
 
@@ -67,9 +73,9 @@ def github_pat() -> str:
 
 
 class Repo:
-    """A git repo with a base commit (optionally holding .gitleaks.toml) and a PR commit."""
+    """A git repo with a base commit and a PR commit. A None value deletes the file in the PR."""
 
-    def __init__(self, root: Path, base_files: dict[str, str], pr_files: dict[str, str]) -> None:
+    def __init__(self, root: Path, base_files: dict[str, str], pr_files: dict[str, str | None]) -> None:
         self.path = root / "repo"
         self.path.mkdir()
         self.git("init", "-q")
@@ -79,7 +85,7 @@ class Repo:
         self.base = self.git("rev-parse", "HEAD")
         self.write(pr_files)
         self.git("add", "-A")
-        self.git("commit", "-q", "-m", "pr")
+        self.git("commit", "-q", "--allow-empty", "-m", "pr")
         self.head = self.git("rev-parse", "HEAD")
 
     def git(self, *args: str) -> str:
@@ -96,11 +102,19 @@ class Repo:
             ["git", "-C", str(self.path), *args], check=True, capture_output=True, text=True, env=env
         ).stdout.strip()
 
-    def write(self, files: dict[str, str]) -> None:
+    def write(self, files: dict[str, str | None]) -> None:
         for name, content in files.items():
             p = self.path / name
+            if content is None:
+                p.unlink()
+                continue
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(content)
+
+
+class Run:
+    def __init__(self, resolve: subprocess.CompletedProcess, scan: subprocess.CompletedProcess | None, findings: list[dict]):
+        self.resolve, self.scan, self.findings = resolve, scan, findings
 
 
 # CI sets REQUIRE_GITLEAKS=1 so a missing binary fails instead of skipping.
@@ -110,8 +124,8 @@ class SharedRulesTest(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp()).resolve()
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
-    def scan(self, pr_files: dict[str, str], base_files: dict[str, str] | None = None) -> list[dict]:
-        """Resolve the config with the workflow's script, then scan base..head like the job."""
+    def job(self, pr_files: dict[str, str | None], base_files: dict[str, str] | None = None, path_prefix: str = "") -> Run:
+        """Run the job's Resolve step, then (if it passed) its Scan step, like the job does."""
         root = self.tmp / f"case{len(list(self.tmp.iterdir()))}"
         root.mkdir()
         repo = Repo(root, base_files or {}, pr_files)
@@ -119,29 +133,35 @@ class SharedRulesTest(unittest.TestCase):
         runner_temp.mkdir()
         output = root / "github_output"
         output.touch()
-        env = {**os.environ, "BASE_SHA": repo.base, "RUNNER_TEMP": str(runner_temp), "GITHUB_OUTPUT": str(output)}
-        subprocess.run(["bash", "-c", resolve_script()], cwd=repo.path, env=env, check=True, capture_output=True)
-        cfg_dir = Path(dict(l.split("=", 1) for l in output.read_text().splitlines())["dir"])
-        report = root / "report.json"
-        rc = subprocess.run(
-            [
-                "gitleaks", "git", str(repo.path),
-                f"--log-opts={repo.base}..{repo.head}",
-                "--config", str(cfg_dir / "gitleaks.toml"),
-                "--gitleaks-ignore-path", str(cfg_dir / ".gitleaksignore"),
-                "--redact", "--no-banner",
-                "--report-format", "json", "--report-path", str(report),
-                "--exit-code", "2",
-            ],
-            capture_output=True, text=True,
-        )
-        self.assertIn(rc.returncode, (0, 2), rc.stderr)
-        return json.loads(report.read_text())
+        env = {
+            **os.environ,
+            "PATH": path_prefix + os.environ["PATH"],
+            "BASE_SHA": repo.base,
+            "HEAD_SHA": repo.head,
+            "HAS_HOTFIX": "false",
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_OUTPUT": str(output),
+        }
+        resolve = subprocess.run(["bash", "-e", "-c", step_script(RESOLVE_STEP)], cwd=repo.path, env=env, capture_output=True, text=True)
+        if resolve.returncode != 0:
+            return Run(resolve, None, [])
+        env["CFG_DIR"] = dict(l.split("=", 1) for l in output.read_text().splitlines())["dir"]
+        scan = subprocess.run(["bash", "-e", "-c", step_script(SCAN_STEP)], cwd=repo.path, env=env, capture_output=True, text=True)
+        report = runner_temp / "gitleaks-report.json"
+        findings = json.loads(report.read_text()) if report.exists() and report.stat().st_size else []
+        return Run(resolve, scan, findings)
+
+    def scan(self, pr_files: dict[str, str | None], base_files: dict[str, str] | None = None) -> list[dict]:
+        """Findings of a job run that must resolve and scan cleanly; the Scan step's exit code must match."""
+        r = self.job(pr_files, base_files)
+        self.assertEqual(r.resolve.returncode, 0, r.resolve.stdout + r.resolve.stderr)
+        self.assertEqual(r.scan.returncode, 1 if r.findings else 0, r.scan.stdout + r.scan.stderr)
+        return r.findings
 
     def hits(self, findings: list[dict], rule: str = RULE) -> list[tuple[str, int]]:
         return sorted((f["File"], f["StartLine"]) for f in findings if f["RuleID"] == rule)
 
-    # --- no .gitleaks.toml on base: defaults + shared rules -------------------
+    # --- the rule (no .gitleaks.toml on base: defaults + shared rules) -------
 
     def test_bare_entry_flagged(self) -> None:
         self.assertEqual(self.hits(self.scan({"a.txt": priv() + "\n"})), [("a.txt", 1)])
@@ -159,8 +179,10 @@ class SharedRulesTest(unittest.TestCase):
         self.assertEqual(self.hits(f), [("c.json", 1), ("c.yaml", 2)])
 
     def test_public_entry_not_flagged(self) -> None:
-        f = self.scan({"quonfig.json": json.dumps({"publicKeys": [PUB + body()]}) + "\n"})
-        self.assertEqual(self.hits(f), [])
+        # One file with both kinds, so the keyword prefilter (qf1-priv-) lets
+        # the regex see the public entry: exactly one finding, on the private one.
+        f = self.scan({"keys.txt": f"{PUB}{body()}\n{priv()}\n{PUB}{body()}\n"})
+        self.assertEqual(self.hits(f), [("keys.txt", 2)])
 
     def test_body_length(self) -> None:
         # 42 characters is not an entry and is not flagged. 44 or more is not a
@@ -177,15 +199,34 @@ class SharedRulesTest(unittest.TestCase):
         f = self.scan({"t.txt": f"token = {github_pat()}\n"})
         self.assertEqual(self.hits(f, "github-pat"), [("t.txt", 1)])
 
-    def test_gitleaksignore_from_base_still_applies(self) -> None:
-        # Same flow as today: a fingerprint on base suppresses that finding.
+    def test_base_gitleaksignore_applies(self) -> None:
+        # The fingerprint is in the BASE .gitleaksignore and the PR deletes the
+        # file, so the head checkout has none: only the job's copy of the base
+        # file (--gitleaks-ignore-path) can suppress the finding. What gitleaks
+        # does with a .gitleaksignore in the PR head is bead qfg-s0ary.
         entry = priv()
-        first = self.scan({"a.txt": entry + "\n"})
-        self.assertEqual(len(self.hits(first)), 1)
-        # Rebuild with the fingerprint (commit-independent form: file:rule:line).
-        ignore = f"a.txt:{RULE}:1\n"
-        f = self.scan({"a.txt": entry + "\n"}, base_files={".gitleaksignore": ignore})
+        f = self.scan({"a.txt": entry + "\n", ".gitleaksignore": None},
+                      base_files={".gitleaksignore": f"a.txt:{RULE}:1\n"})
         self.assertEqual(self.hits(f), [])
+        # Control: without that base entry the same change is a finding.
+        f = self.scan({"a.txt": entry + "\n", ".gitleaksignore": None},
+                      base_files={".gitleaksignore": "other.txt:x:1\n"})
+        self.assertEqual(self.hits(f), [("a.txt", 1)])
+
+    # --- config comes from the BASE commit, never the PR ---------------------
+
+    def test_pr_cannot_allowlist_itself_with_its_own_gitleaks_toml(self) -> None:
+        allow_all = textwrap.dedent("""\
+            [extend]
+            useDefault = true
+
+            [[allowlists]]
+            paths = ['''.*''']
+            regexes = ['''.*''']
+            """)
+        r = self.job({".gitleaks.toml": allow_all, "a.txt": priv() + "\n"})
+        self.assertEqual(self.hits(r.findings), [("a.txt", 1)])
+        self.assertEqual(r.scan.returncode, 1)
 
     # --- repo with its own .gitleaks.toml on base ----------------------------
 
@@ -222,7 +263,7 @@ class SharedRulesTest(unittest.TestCase):
         # rule. The shared rule is added, the path allowlist covers the
         # vectors, and the targeted allowlist and disabledRules keep working.
         # (gitleaks drops the targetRules allowlists of a config pulled in
-        # through [extend] path, which is why the job appends instead.)
+        # through [extend] path, which is why the job does not wrap.)
         base = {".gitleaks.toml": textwrap.dedent("""\
             [extend]
             useDefault = true
@@ -247,32 +288,105 @@ class SharedRulesTest(unittest.TestCase):
         f = self.scan({"c.yaml": self.KEY_LINE}, {".gitleaks.toml": "[extend]\nuseDefault = true\n"})
         self.assertEqual(self.hits(f, "generic-api-key"), [("c.yaml", 1)])
 
-    def test_repo_declaring_the_rule_id_keeps_its_declaration(self) -> None:
-        # integration-test-data declares the same id itself. The job then does
-        # not append a second copy: one rule, and the repo's is in force (here
-        # narrowed to entries starting AAAA so the test can tell them apart).
-        base = {".gitleaks.toml": textwrap.dedent(f"""\
-            [extend]
-            useDefault = true
+    def test_disabled_rules_cannot_turn_off_the_shared_rule(self) -> None:
+        # disabledRules only removes rules of the config a repo extends (the
+        # gitleaks defaults); the shared rule is added on top, so it stays on.
+        base = {".gitleaks.toml": f'[extend]\nuseDefault = true\ndisabledRules = ["{RULE}"]\n'}
+        f = self.scan({"a.txt": priv() + "\n"}, base)
+        self.assertEqual(self.hits(f), [("a.txt", 1)])
 
-            [[rules]]
-            id = "{RULE}"
-            description = "local copy"
-            regex = '''qf1-priv-AAAA[A-Za-z0-9_-]{{39}}'''
-            keywords = ["qf1-priv-"]
-            """) + self.KEY_ALLOWLIST}
-        f = self.scan({"a.txt": f"{PRIV}AAAA{body(39)}\n{priv()}\n", "c.yaml": self.KEY_LINE}, base)
+    NARROW_RULE = textwrap.dedent(f"""\
+        [[rules]]
+        id = "{RULE}"
+        description = "local copy"
+        regex = '''qf1-priv-AAAA[A-Za-z0-9_-]{{39}}'''
+        keywords = ["qf1-priv-"]
+        """)
+
+    def narrowed_pair(self) -> str:
+        """Line 1 matches the narrowed local rule, line 2 only the shared one."""
+        b = body()
+        while b.startswith("AAAA"):
+            b = body()
+        return f"{PRIV}AAAA{body(39)}\n{PRIV}{b}\n"
+
+    def test_repo_declaring_the_rule_id_keeps_its_declaration(self) -> None:
+        # integration-test-data declares the same id itself. The shared copy is
+        # not added: one rule, and the repo's is in force (here narrowed to
+        # entries starting AAAA so the test can tell them apart).
+        base = {".gitleaks.toml": "[extend]\nuseDefault = true\n\n" + self.NARROW_RULE + "\n" + self.KEY_ALLOWLIST}
+        f = self.scan({"a.txt": self.narrowed_pair(), "c.yaml": self.KEY_LINE}, base)
         self.assertEqual(self.hits(f), [("a.txt", 1)])
         self.assertEqual(self.hits(f, "generic-api-key"), [])
+
+    def test_quoted_id_key_is_a_declaration(self) -> None:
+        # `"id" = ...` is the same TOML key as `id = ...`: the repo's rule is in force.
+        base = {".gitleaks.toml": "[extend]\nuseDefault = true\n\n" + self.NARROW_RULE.replace("\nid = ", '\n"id" = ')}
+        f = self.scan({"a.txt": self.narrowed_pair()}, base)
+        self.assertEqual(self.hits(f), [("a.txt", 1)])
+
+    def test_id_in_a_comment_is_not_a_declaration(self) -> None:
+        base = {".gitleaks.toml": f'[extend]\nuseDefault = true\n# id = "{RULE}"\n'}
+        f = self.scan({"a.txt": priv() + "\n"}, base)
+        self.assertEqual(self.hits(f), [("a.txt", 1)])
+
+    def test_id_in_a_multiline_string_is_not_a_declaration(self) -> None:
+        base = {".gitleaks.toml": textwrap.dedent(f'''\
+            description = """
+            id = "{RULE}"
+            """
+            [extend]
+            useDefault = true
+            ''')}
+        f = self.scan({"a.txt": priv() + "\n"}, base)
+        self.assertEqual(self.hits(f), [("a.txt", 1)])
+
+    def test_inline_rules_array_is_merged(self) -> None:
+        # `rules = [{...}]` cannot take an appended [[rules]] table; the job
+        # merges by parse and re-emits, so both rules are in force.
+        base = {".gitleaks.toml": "rules = [{id = \"own-rule\", regex = '''own-[0-9]{6}'''}]\n"
+                                  "[extend]\nuseDefault = true\n"}
+        f = self.scan({"a.txt": f"{priv()}\nown-123456\ntoken = {github_pat()}\n"}, base)
+        self.assertEqual(self.hits(f), [("a.txt", 1)])
+        self.assertEqual(self.hits(f, "own-rule"), [("a.txt", 2)])
+        self.assertEqual(self.hits(f, "github-pat"), [("a.txt", 3)])
 
     def test_repo_config_without_trailing_newline(self) -> None:
         f = self.scan({"a.txt": priv() + "\n"}, {".gitleaks.toml": "[extend]\nuseDefault = true"})
         self.assertEqual(self.hits(f), [("a.txt", 1)])
 
-    def test_resolve_script_extracted(self) -> None:
-        script = resolve_script()
-        self.assertIn(RULE, script)
-        self.assertTrue(re.search(r"^SHARED_RULES$", script, re.M), "heredoc terminator must be at column 0")
+    # --- fails closed ---------------------------------------------------------
+
+    def assert_resolve_fails(self, r: Run, needle: str) -> None:
+        self.assertNotEqual(r.resolve.returncode, 0)
+        self.assertIsNone(r.scan)
+        self.assertIn(needle, r.resolve.stdout + r.resolve.stderr)
+
+    def test_invalid_repo_config_fails_closed(self) -> None:
+        r = self.job({"a.txt": "x\n"}, {".gitleaks.toml": "[extend\nuseDefault = true\n"})
+        self.assert_resolve_fails(r, "not valid TOML")
+
+    def test_rules_not_an_array_of_tables_fails_closed(self) -> None:
+        r = self.job({"a.txt": "x\n"}, {".gitleaks.toml": 'rules = "nope"\n'})
+        self.assert_resolve_fails(r, "must be an array of tables")
+
+    def test_missing_tomllib_fails_closed(self) -> None:
+        # A python3 without tomllib on PATH: a repo with its own config fails
+        # the check with the cause; a repo without one does not need python.
+        fake = self.tmp / "oldpython"
+        fake.mkdir()
+        py = fake / "python3"
+        py.write_text("#!/bin/sh\necho 'Python 3.9.0'; exit 1\n")
+        py.chmod(py.stat().st_mode | stat.S_IEXEC)
+        r = self.job({"a.txt": "x\n"}, {".gitleaks.toml": "[extend]\nuseDefault = true\n"}, path_prefix=f"{fake}:")
+        self.assert_resolve_fails(r, "tomllib")
+        r = self.job({"a.txt": priv() + "\n"}, path_prefix=f"{fake}:")
+        self.assertEqual(r.resolve.returncode, 0, r.resolve.stdout + r.resolve.stderr)
+        self.assertEqual(self.hits(r.findings), [("a.txt", 1)])
+
+    def test_steps_extracted(self) -> None:
+        self.assertIn(RULE, step_script(RESOLVE_STEP))
+        self.assertIn("gitleaks git .", step_script(SCAN_STEP))
 
 
 if __name__ == "__main__":

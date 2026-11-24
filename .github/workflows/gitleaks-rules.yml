@@ -45,4 +45,6 @@ jobs:
       - name: Test the shared rules
         env:
           REQUIRE_GITLEAKS: "1"
-        run: python3 -m unittest discover -v -s scripts/gitleaks
+        run: |
+          python3 --version
+          python3 -m unittest discover -v -s scripts/gitleaks
